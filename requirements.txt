@@ -33,3 +33,4 @@ email-validator==2.2.0
 ipaddress  # stdlib, listed for clarity
 beautifulsoup4==4.12.3
 lxml==5.1.0
+python-Wappalyzer==0.3.1
