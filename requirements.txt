@@ -34,4 +34,4 @@ ipaddress  # stdlib, listed for clarity
 beautifulsoup4==4.12.3
 lxml==5.1.0
 python-Wappalyzer==0.3.1
-setuptools
+setuptools<70.0.0
