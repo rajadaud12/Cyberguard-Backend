@@ -638,7 +638,7 @@ async def _generate_findings(
     # Potential CVE Findings (Layer 1 - Passive)
     for cve in cve_data:
         findings_to_create.append({
-            "severity": _adjust_severity(cve.get("severity", "medium")),
+            "severity": "info",
             "source": "ext_scanner",
             "issue_type": f"Vulnerability {cve.get('cve_id')}",
             "entity": hostname,
