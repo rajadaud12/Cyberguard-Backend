@@ -9,6 +9,9 @@ logger = logging.getLogger(__name__)
 
 import shutil
 
+# Global lock to serialize Nuclei scans to prevent RAM exhaustion (OOM) on low-resource servers
+_NUCLEI_SEM = asyncio.Semaphore(1)
+
 class NucleiVerificationEngine:
     def __init__(self):
         # Resolve backend root directory (two levels up from app/services/verification_engine.py)
@@ -33,60 +36,82 @@ class NucleiVerificationEngine:
             logger.error("Nuclei binary not found. Skipping verification.")
             return []
 
-        results = []
+        async with _NUCLEI_SEM:
+            results = []
 
-        # Normalize targets: scan each URL individually for multi-port hosts
-        if isinstance(target_url, list):
-            targets = target_url
-        else:
-            targets = [target_url]
+            # Normalize targets: scan each URL individually for multi-port hosts
+            if isinstance(target_url, list):
+                targets = target_url
+            else:
+                targets = [target_url]
 
-        # ── Phase 1: Broad exposure/misconfig scan (high-signal, fast) ──
-        # These tag categories reliably catch .env leaks, exposed panels,
-        # default credentials, misconfigurations, and takeover opportunities.
-        phase1_tags = "exposure,misconfig,default-login,takeover,config,env,file"
+            # ── Phase 1: Broad exposure/misconfig scan (high-signal, fast) ──
+            # These tag categories reliably catch .env leaks, exposed panels,
+            # default credentials, misconfigurations, and takeover opportunities.
+            phase1_tags = "exposure,misconfig,default-login,takeover,config,env,file"
 
-        # ── Phase 2: Technology-specific vulnerability scan ──
-        # Use tech-stack detected tags to run targeted CVE/vuln templates.
-        # Filter out garbage tags that would match nothing.
-        VALID_TECH_TAGS = {
-            "nginx", "apache", "iis", "php", "laravel", "wordpress", "joomla",
-            "drupal", "django", "flask", "express", "nodejs", "node", "react",
-            "nextjs", "next.js", "angular", "vue", "nuxt", "tomcat", "spring",
-            "struts", "rails", "ruby", "asp.net", "dotnet", "java", "jenkins",
-            "grafana", "kibana", "elasticsearch", "redis", "mongodb", "mysql",
-            "postgres", "mssql", "oracle", "docker", "kubernetes", "gitlab",
-            "bitbucket", "confluence", "jira", "sonarqube", "rabbitmq",
-            "apache-http-server", "litespeed", "caddy", "openresty", "varnish",
-            "shopify", "magento", "prestashop", "woocommerce", "webflow",
-            "cloudflare", "fastly", "akamai", "aws", "azure", "gcp",
-            "minio", "adminer", "phpmyadmin", "wp-admin",
-        }
-        tech_tags_filtered = [t for t in tags if t in VALID_TECH_TAGS]
+            # ── Phase 2: Technology-specific vulnerability scan ──
+            # Use tech-stack detected tags to run targeted CVE/vuln templates.
+            # Filter out garbage tags that would match nothing.
+            VALID_TECH_TAGS = {
+                "nginx", "apache", "iis", "php", "laravel", "wordpress", "joomla",
+                "drupal", "django", "flask", "express", "nodejs", "node", "react",
+                "nextjs", "next.js", "angular", "vue", "nuxt", "tomcat", "spring",
+                "struts", "rails", "ruby", "asp.net", "dotnet", "java", "jenkins",
+                "grafana", "kibana", "elasticsearch", "redis", "mongodb", "mysql",
+                "postgres", "mssql", "oracle", "docker", "kubernetes", "gitlab",
+                "bitbucket", "confluence", "jira", "sonarqube", "rabbitmq",
+                "apache-http-server", "litespeed", "caddy", "openresty", "varnish",
+                "shopify", "magento", "prestashop", "woocommerce", "webflow",
+                "cloudflare", "fastly", "akamai", "aws", "azure", "gcp",
+                "minio", "adminer", "phpmyadmin", "wp-admin",
+            }
+            tech_tags_filtered = [t for t in tags if t in VALID_TECH_TAGS]
 
-        all_results = []
-        for target in targets:
-            # Phase 1: exposure/misconfig scan
-            r1 = await self._run_nuclei(target, phase1_tags)
-            all_results.extend(r1)
+            all_results = []
+            for target in targets:
+                # Phase 1: exposure/misconfig scan (Only load relevant subdirectories to save RAM)
+                phase1_paths = []
+                if self.templates_dir.exists():
+                    for d in ["http/exposures", "http/misconfiguration", "http/default-logins", "http/exposed-panels", "http/takeovers"]:
+                        p = self.templates_dir / d
+                        if p.exists():
+                            phase1_paths.append(str(p))
+                
+                if not phase1_paths and self.templates_dir.exists():
+                    phase1_paths = [str(self.templates_dir)]
 
-            # Phase 2: tech-specific scan (only if we have relevant tags)
-            if tech_tags_filtered:
-                phase2_tags = ",".join(tech_tags_filtered)
-                r2 = await self._run_nuclei(target, phase2_tags)
-                all_results.extend(r2)
+                r1 = await self._run_nuclei(target, phase1_tags, phase1_paths)
+                all_results.extend(r1)
 
-        # Deduplicate by template_id + matched_at
-        seen = set()
-        for r in all_results:
-            key = (r.get("template_id", ""), r.get("matched_at", ""))
-            if key not in seen:
-                seen.add(key)
-                results.append(r)
+                # Phase 2: tech-specific scan (Only load tech stacks & CVEs folders to save RAM)
+                if tech_tags_filtered:
+                    phase2_tags = ",".join(tech_tags_filtered)
+                    
+                    phase2_paths = []
+                    if self.templates_dir.exists():
+                        for d in ["http/technologies", "http/cves"]:
+                            p = self.templates_dir / d
+                            if p.exists():
+                                phase2_paths.append(str(p))
+                    
+                    if not phase2_paths and self.templates_dir.exists():
+                        phase2_paths = [str(self.templates_dir)]
 
-        return results
+                    r2 = await self._run_nuclei(target, phase2_tags, phase2_paths)
+                    all_results.extend(r2)
 
-    async def _run_nuclei(self, target: str, tags: str) -> list[dict]:
+            # Deduplicate by template_id + matched_at
+            seen = set()
+            for r in all_results:
+                key = (r.get("template_id", ""), r.get("matched_at", ""))
+                if key not in seen:
+                    seen.add(key)
+                    results.append(r)
+
+            return results
+
+    async def _run_nuclei(self, target: str, tags: str, template_paths: list[str]) -> list[dict]:
         """Run a single Nuclei scan against a target with given tags."""
         results = []
 
@@ -107,7 +132,9 @@ class NucleiVerificationEngine:
         ]
 
         if self.templates_dir.exists():
-            cmd.extend(["-ud", str(self.templates_dir), "-t", str(self.templates_dir)])
+            cmd.extend(["-ud", str(self.templates_dir)])
+            for path in template_paths:
+                cmd.extend(["-t", path])
 
         try:
             logger.info(f"Running Nuclei on {target} with tags: {tags}")
