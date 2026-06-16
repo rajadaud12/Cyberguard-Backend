@@ -50,8 +50,8 @@ class NucleiVerificationEngine:
 
             # ── Phase 1: Broad exposure/misconfig scan (high-signal, fast) ──
             # These tag categories reliably catch .env leaks, exposed panels,
-            # default credentials, misconfigurations, and takeover opportunities.
-            phase1_tags = "exposure,misconfig,default-login,takeover,config,env,file"
+            # default credentials, and takeover opportunities.
+            phase1_tags = "exposure,default-login,takeover,env"
 
             # ── Phase 2: Technology-specific vulnerability scan ──
             # Use tech-stack detected tags to run targeted CVE/vuln templates.
@@ -74,7 +74,7 @@ class NucleiVerificationEngine:
             # Phase 1: exposure/misconfig scan (Only load relevant subdirectories to save RAM)
             phase1_paths = []
             if self.templates_dir.exists():
-                for d in ["http/exposures", "http/misconfiguration", "http/default-logins", "http/exposed-panels", "http/takeovers"]:
+                for d in ["http/exposures", "http/default-logins", "http/exposed-panels", "http/takeovers"]:
                     p = self.templates_dir / d
                     if p.exists():
                         phase1_paths.append(str(p))
@@ -153,9 +153,9 @@ class NucleiVerificationEngine:
             "-severity", "info,low,medium,high,critical",
             "-timeout", "3",    # Per-request timeout in seconds (optimized down from 5)
             "-retries", "1",
-            "-bulk-size", "2",  # Reduced parallel hosts per template to save RAM (from 5)
-            "-rate-limit", "15", # Prevent choking local network/FD limits (from 25)
-            "-c", "2",          # Reduced concurrency threads to stay under 512MB RAM (from 5)
+            "-bulk-size", "3",  # Dynamic batching per template
+            "-rate-limit", "25", # Safe network rate-limit limit
+            "-c", "3",          # Concurrency limit (safe for 512MB RAM but faster than 2)
         ]
 
         if self.templates_dir.exists():
@@ -173,7 +173,7 @@ class NucleiVerificationEngine:
                     text=True,
                     encoding='utf-8',
                     errors='replace',
-                    timeout=180  # Hard timeout of 3 minutes per run
+                    timeout=300  # Hard timeout of 5 minutes per run (increased from 180s)
                 )
 
             process = await asyncio.to_thread(run_nuclei)
