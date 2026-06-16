@@ -45,6 +45,9 @@ class NucleiVerificationEngine:
             else:
                 targets = [target_url]
 
+            if not targets:
+                return []
+
             # ── Phase 1: Broad exposure/misconfig scan (high-signal, fast) ──
             # These tag categories reliably catch .env leaks, exposed panels,
             # default credentials, misconfigurations, and takeover opportunities.
@@ -68,38 +71,37 @@ class NucleiVerificationEngine:
             }
             tech_tags_filtered = [t for t in tags if t in VALID_TECH_TAGS]
 
+            # Phase 1: exposure/misconfig scan (Only load relevant subdirectories to save RAM)
+            phase1_paths = []
+            if self.templates_dir.exists():
+                for d in ["http/exposures", "http/misconfiguration", "http/default-logins", "http/exposed-panels", "http/takeovers"]:
+                    p = self.templates_dir / d
+                    if p.exists():
+                        phase1_paths.append(str(p))
+            
+            if not phase1_paths and self.templates_dir.exists():
+                phase1_paths = [str(self.templates_dir)]
+
             all_results = []
-            for target in targets:
-                # Phase 1: exposure/misconfig scan (Only load relevant subdirectories to save RAM)
-                phase1_paths = []
+            r1 = await self._run_nuclei_batch(targets, phase1_tags, phase1_paths)
+            all_results.extend(r1)
+
+            # Phase 2: tech-specific scan (Only load tech stacks & CVEs folders to save RAM)
+            if tech_tags_filtered:
+                phase2_tags = ",".join(tech_tags_filtered)
+                
+                phase2_paths = []
                 if self.templates_dir.exists():
-                    for d in ["http/exposures", "http/misconfiguration", "http/default-logins", "http/exposed-panels", "http/takeovers"]:
+                    for d in ["http/technologies", "http/cves"]:
                         p = self.templates_dir / d
                         if p.exists():
-                            phase1_paths.append(str(p))
+                            phase2_paths.append(str(p))
                 
-                if not phase1_paths and self.templates_dir.exists():
-                    phase1_paths = [str(self.templates_dir)]
+                if not phase2_paths and self.templates_dir.exists():
+                    phase2_paths = [str(self.templates_dir)]
 
-                r1 = await self._run_nuclei(target, phase1_tags, phase1_paths)
-                all_results.extend(r1)
-
-                # Phase 2: tech-specific scan (Only load tech stacks & CVEs folders to save RAM)
-                if tech_tags_filtered:
-                    phase2_tags = ",".join(tech_tags_filtered)
-                    
-                    phase2_paths = []
-                    if self.templates_dir.exists():
-                        for d in ["http/technologies", "http/cves"]:
-                            p = self.templates_dir / d
-                            if p.exists():
-                                phase2_paths.append(str(p))
-                    
-                    if not phase2_paths and self.templates_dir.exists():
-                        phase2_paths = [str(self.templates_dir)]
-
-                    r2 = await self._run_nuclei(target, phase2_tags, phase2_paths)
-                    all_results.extend(r2)
+                r2 = await self._run_nuclei_batch(targets, phase2_tags, phase2_paths)
+                all_results.extend(r2)
 
             # Deduplicate by template_id + matched_at
             seen = set()
@@ -111,24 +113,46 @@ class NucleiVerificationEngine:
 
             return results
 
-    async def _run_nuclei(self, target: str, tags: str, template_paths: list[str]) -> list[dict]:
-        """Run a single Nuclei scan against a target with given tags."""
+    async def _run_nuclei_batch(self, targets: list[str], tags: str, template_paths: list[str]) -> list[dict]:
+        """Run a single Nuclei scan against multiple targets written to a file with given tags."""
+        import tempfile
+
+        # Ensure temp directory exists under backend root or uses system temp safely
+        temp_dir = self.base_dir / "tmp"
+        temp_dir.mkdir(exist_ok=True)
+
+        fd, temp_file_path = tempfile.mkstemp(suffix="_nuclei_targets.txt", dir=str(temp_dir))
+        try:
+            with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                for target in targets:
+                    f.write(f"{target}\n")
+            
+            results = await self._run_nuclei(temp_file_path, tags, template_paths)
+            return results
+        finally:
+            try:
+                os.remove(temp_file_path)
+            except Exception:
+                pass
+
+    async def _run_nuclei(self, targets_file: str, tags: str, template_paths: list[str]) -> list[dict]:
+        """Run Nuclei command line tool using a targets file input."""
         results = []
 
         cmd = [
             str(self.nuclei_bin),
-            "-u", target,
+            "-list", targets_file,
             "-jsonl",
             "-silent",
             "-nc",
-            "-duc",           # Disable update checks which can hang
+            "-duc",             # Disable update checks which can hang
             "-tags", tags,
             "-severity", "info,low,medium,high,critical",
-            "-timeout", "5",   # Per-request timeout in seconds
+            "-timeout", "3",    # Per-request timeout in seconds (optimized down from 5)
             "-retries", "1",
-            "-bulk-size", "5",  # Limit parallel hosts
-            "-rate-limit", "25", # Prevent network choking
-            "-c", "5",          # Only 5 concurrent template threads to stay under 512MB RAM
+            "-bulk-size", "2",  # Reduced parallel hosts per template to save RAM (from 5)
+            "-rate-limit", "15", # Prevent choking local network/FD limits (from 25)
+            "-c", "2",          # Reduced concurrency threads to stay under 512MB RAM (from 5)
         ]
 
         if self.templates_dir.exists():
@@ -137,7 +161,7 @@ class NucleiVerificationEngine:
                 cmd.extend(["-t", path])
 
         try:
-            logger.info(f"Running Nuclei on {target} with tags: {tags}")
+            logger.info(f"Running Nuclei batch scan with tags: {tags}")
 
             def run_nuclei():
                 return subprocess.run(
@@ -182,8 +206,8 @@ class NucleiVerificationEngine:
                             logger.debug(f"Nuclei: {line}")
 
         except subprocess.TimeoutExpired:
-            logger.warning(f"Nuclei timed out for {target} with tags {tags}")
+            logger.warning(f"Nuclei batch timed out for tags {tags}")
         except Exception as e:
-            logger.exception(f"Nuclei execution failed for {target}")
+            logger.exception("Nuclei batch execution failed")
 
         return results

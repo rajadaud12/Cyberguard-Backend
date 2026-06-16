@@ -54,8 +54,8 @@ logger = logging.getLogger(__name__)
 
 # ── Concurrency guards ─────────────────────────────────────────────────────────
 # Limits the total number of hosts scanned concurrently across ALL tenants.
-# Prevents socket/FD exhaustion and DB pool starvation under heavy multi-tenant load.
-_GLOBAL_SCAN_SEM = asyncio.Semaphore(25)
+# Kept LOW (3) to prevent socket/FD/memory exhaustion on 512MB Render instances.
+_GLOBAL_SCAN_SEM = asyncio.Semaphore(1)
 
 # Tracks tenant locks to queue background scans sequentially.
 # Prevents duplicate scans overlapping, but allows them to queue.
@@ -67,16 +67,15 @@ def _get_tenant_lock(tenant_id: str) -> asyncio.Lock:
     return _TENANT_LOCKS[tenant_id]
 
 # ── Shared HTTP client ─────────────────────────────────────────────────────────
-# Re-used across all probe functions. Connection limits prevent socket exhaustion.
-# Created at module load and closed gracefully on shutdown.
+# Re-used across all probe functions. Connection limits kept low for 512MB servers.
 _HTTP_CLIENT = httpx.AsyncClient(
     follow_redirects=True,
     timeout=5.0,
     verify=False,
     limits=httpx.Limits(
-        max_connections=150,          # hard cap on total open connections
-        max_keepalive_connections=40, # keep-alive pool size
-        keepalive_expiry=10,          # seconds before idle conn is closed
+        max_connections=20,            # low cap for 512MB server
+        max_keepalive_connections=5,   # minimal keep-alive pool
+        keepalive_expiry=5,            # close idle conns quickly
     ),
     headers={"User-Agent": "CyberGuard-EASM/1.0"},
 )
@@ -1439,9 +1438,11 @@ async def _run_easm_scan_inner(tenant_id: str, scope_values: list[str], passed_j
     except Exception as e:
         logger.warning(f"[EASM] Could not update/create scan job record: {e}")
 
-    # ── Scan each host ────────────────────────────────────────────────────────
+    # ── Scan each host (batched to prevent resource exhaustion) ─────────────
+    import gc
     completed = 0
     failed = 0
+    BATCH_SIZE = 1  # Process 1 host at a time to stay under 512MB RAM
     
     async def _worker(domain_to_scan: str):
         try:
@@ -1451,16 +1452,22 @@ async def _run_easm_scan_inner(tenant_id: str, scope_values: list[str], passed_j
             logger.error(f"[EASM] Failed to scan {domain_to_scan}: {e}")
             return (domain_to_scan, False)
 
-    tasks = [asyncio.create_task(_worker(d)) for d in domains]
-    
-    for future in asyncio.as_completed(tasks):
-        _, success = await future
-        if success:
-            completed += 1
-        else:
-            failed += 1
+    for i in range(0, len(domains), BATCH_SIZE):
+        batch = domains[i:i + BATCH_SIZE]
+        logger.info(f"[EASM] Scanning batch {i // BATCH_SIZE + 1}/{(len(domains) + BATCH_SIZE - 1) // BATCH_SIZE}: {len(batch)} host(s)")
+        
+        tasks = [asyncio.create_task(_worker(d)) for d in batch]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        for result in results:
+            if isinstance(result, Exception):
+                failed += 1
+            elif isinstance(result, tuple) and result[1]:
+                completed += 1
+            else:
+                failed += 1
 
-        # Update progress on job record
+        # Update progress on job record after each batch
         if job_id:
             try:
                 async with get_tenant_db(tenant_id) as session:
@@ -1479,6 +1486,9 @@ async def _run_easm_scan_inner(tenant_id: str, scope_values: list[str], passed_j
                         await session.commit()
             except Exception:
                 pass
+        
+        # Force GC between batches to reclaim memory
+        gc.collect()
 
     # ── Mark asset discovery phase complete ────────────────────────────────
     logger.info(f"[EASM] Asset discovery complete for tenant {tenant_id}: {completed} ok, {failed} failed, {total_subdomains} subdomains found")
@@ -1489,7 +1499,7 @@ async def _run_easm_scan_inner(tenant_id: str, scope_values: list[str], passed_j
     nuclei_ok = 0
     nuclei_fail = 0
     try:
-        nuclei_ok, nuclei_fail = await _run_nuclei_phase(tenant_id, domains, modules)
+        nuclei_ok, nuclei_fail = await _run_nuclei_phase(tenant_id, domains, modules, job_id=job_id)
     except Exception as e:
         logger.error(f"[EASM] Nuclei phase failed: {e}")
 
@@ -1522,7 +1532,7 @@ async def _run_easm_scan_inner(tenant_id: str, scope_values: list[str], passed_j
 
 # ── Nuclei Vulnerability Scan Phase (runs separately after asset discovery) ────
 
-async def _run_nuclei_phase(tenant_id: str, domains: list[str], modules: list[str] | None = None) -> tuple[int, int]:
+async def _run_nuclei_phase(tenant_id: str, domains: list[str], modules: list[str] | None = None, job_id: uuid.UUID | None = None) -> tuple[int, int]:
     """
     Phase 2 of the EASM scan: Run Nuclei vulnerability scanning.
     
@@ -1547,7 +1557,25 @@ async def _run_nuclei_phase(tenant_id: str, domains: list[str], modules: list[st
     
     logger.info(f"[EASM/Nuclei] Starting vulnerability scan phase for {len(domains)} host(s)")
     
-    for hostname in domains:
+    for idx, hostname in enumerate(domains):
+        # Update progress metadata in database
+        if job_id:
+            try:
+                async with get_tenant_db(tenant_id) as session:
+                    from sqlalchemy import select as _select
+                    result = await session.execute(_select(ScanJob).where(ScanJob.id == job_id))
+                    j = result.scalar_one_or_none()
+                    if j:
+                        meta = dict(j.metadata_ or {})
+                        meta["phase"] = "vuln"
+                        meta["vuln_total"] = len(domains)
+                        meta["vuln_completed"] = ok_count
+                        meta["vuln_failed"] = fail_count
+                        j.metadata_ = meta
+                        await session.commit()
+            except Exception as e:
+                logger.warning(f"[EASM/Nuclei] Could not update scan job progress metadata: {e}")
+
         try:
             # Read the stored asset to get tech_stack and web URLs
             async with get_tenant_db(tenant_id) as session:
@@ -1563,6 +1591,7 @@ async def _run_nuclei_phase(tenant_id: str, domains: list[str], modules: list[st
                 
                 if not asset:
                     logger.debug(f"[EASM/Nuclei] No asset found for {hostname}, skipping")
+                    ok_count += 1
                     continue
                 
                 # Parse tech_stack from stored JSON strings
@@ -1597,11 +1626,18 @@ async def _run_nuclei_phase(tenant_id: str, domains: list[str], modules: list[st
                 
                 asset_criticality = asset.asset_criticality or "medium"
             
+            # Skip nuclei running if there are absolutely no open web URLs to target!
+            # Loopback or missing web services will immediately time out.
+            if not open_web_urls:
+                logger.info(f"[EASM/Nuclei] {hostname} has no open web ports. Skipping Nuclei scan.")
+                ok_count += 1
+                continue
+
             # Build tech tags for Nuclei
             tech_tags = [t.get("name", "").lower().replace(" ", "-") for t in tech_stack if t.get("name")]
             
             # Run Nuclei for this single host (verify() already has the global semaphore)
-            targets = list(open_web_urls) if open_web_urls else [hostname]
+            targets = list(open_web_urls)
             logger.info(f"[EASM/Nuclei] Scanning {hostname} ({len(targets)} URL(s))")
             
             raw_nuclei_data = await engine.verify(targets, tags=tech_tags)
@@ -1613,6 +1649,7 @@ async def _run_nuclei_phase(tenant_id: str, domains: list[str], modules: list[st
                 if "wappalyzer" in t_id or t_id.endswith("-detect") or "tech" in t_id:
                     continue  # Skip tech detections, we already have tech_stack
                 nuclei_findings.append(n)
+
             
             # Write Nuclei findings to DB
             if nuclei_findings:

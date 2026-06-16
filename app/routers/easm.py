@@ -672,7 +672,28 @@ async def get_scan_status(
     total = meta.get("total", 0)
     completed = meta.get("completed", 0)
     failed = meta.get("failed", 0)
-    percent = round((completed + failed) / total * 100) if total > 0 else 0
+    modules = meta.get("modules")
+    
+    phase = meta.get("phase", "discovery")
+    vuln_total = meta.get("vuln_total", 0)
+    vuln_completed = meta.get("vuln_completed", 0)
+    vuln_failed = meta.get("vuln_failed", 0)
+
+    # Determine if vuln scanning is active/requested
+    has_vuln = not modules or "vuln" in modules
+    
+    if not has_vuln:
+        percent = round((completed + failed) / total * 100) if total > 0 else 0
+    else:
+        # Phase 1: asset discovery maps to 0-50%
+        # Phase 2: nuclei vulnerability maps to 50-100%
+        if phase == "discovery" or phase != "vuln":
+            disc_percent = (completed + failed) / total if total > 0 else 0
+            percent = round(disc_percent * 50)
+        else:
+            # We are in vuln phase
+            vuln_percent = (vuln_completed + vuln_failed) / vuln_total if vuln_total > 0 else 0
+            percent = round(50 + (vuln_percent * 50))
 
     from datetime import datetime, timezone
     
@@ -686,13 +707,25 @@ async def get_scan_status(
         "job_id": str(job.id),
         "status": job.status,          # queued | running | completed | failed
         "targets": meta.get("targets", []),
-        "total": total,
-        "completed": completed,
-        "failed": failed,
+        
+        # Keep old properties for backward compatibility
+        "total": total if phase != "vuln" else vuln_total,
+        "completed": completed if phase != "vuln" else vuln_completed,
+        "failed": failed if phase != "vuln" else vuln_failed,
+        
         "percent_complete": percent,
         "started_at": job.started_at.isoformat() if job.started_at else None,
         "completed_at": job.completed_at.isoformat() if job.completed_at else None,
         "elapsed_seconds": elapsed_seconds,
         "error_message": job.error_message,
+        
+        # New multi-phase properties
+        "phase": phase,
+        "vuln_total": vuln_total,
+        "vuln_completed": vuln_completed,
+        "vuln_failed": vuln_failed,
     }
+
+
+
 
