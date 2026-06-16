@@ -8,11 +8,7 @@ echo "=== Starting Build Process ==="
 echo "Installing python dependencies..."
 pip install -r requirements.txt
 
-# 2. Download and install Nuclei Linux binary
-if [ -f bin/nuclei ]; then
-    echo "Nuclei binary already exists at bin/nuclei. Skipping download."
-else
-    python install_nuclei.py
-fi
+# 2. Download, install, and initialize Nuclei
+python install_nuclei.py
 
 echo "=== Build Process Completed Successfully ==="
