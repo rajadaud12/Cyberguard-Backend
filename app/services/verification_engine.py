@@ -146,6 +146,9 @@ class NucleiVerificationEngine:
             "-silent",
             "-nc",
             "-duc",             # Disable update checks which can hang
+            "-ni",              # Disable Interactsh (OAST) to prevent polling delays/hangs
+            "-no-stdin",        # Disable stdin processing to prevent hanging in background
+            "-mhe", "5",        # Max host errors before skipping host to save time
             "-tags", tags,
             "-severity", "info,low,medium,high,critical",
             "-timeout", "3",    # Per-request timeout in seconds (optimized down from 5)
@@ -156,12 +159,12 @@ class NucleiVerificationEngine:
         ]
 
         if self.templates_dir.exists():
-            cmd.extend(["-ud", str(self.templates_dir)])
             for path in template_paths:
                 cmd.extend(["-t", path])
 
         try:
             logger.info(f"Running Nuclei batch scan with tags: {tags}")
+
 
             def run_nuclei():
                 return subprocess.run(
