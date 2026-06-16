@@ -1,4 +1,0 @@
-http://mythai.pro:80
-https://mythai.pro
-http://mythai.pro
-https://mythai.pro:443
