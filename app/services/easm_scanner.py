@@ -819,6 +819,36 @@ async def _generate_findings(
     Deduplicates by entity+issue_type before inserting.
     Adjusts severity based on asset criticality and includes real CVEs.
     """
+    # 1. Resolve base domain using ScanScope or fallback
+    scopes_res = await session.execute(
+        select(ScanScope).where(
+            and_(
+                ScanScope.tenant_id == tenant_id,
+                ScanScope.type == "domain"
+            )
+        )
+    )
+    domain_scopes = [s.value.lower().strip() for s in scopes_res.scalars().all()]
+
+    def _get_base_domain(hn: str, scopes: list[str]) -> str:
+        hn_lower = hn.lower().strip()
+        matching_scopes = []
+        for d in scopes:
+            if hn_lower == d or hn_lower.endswith("." + d):
+                matching_scopes.append(d)
+        if matching_scopes:
+            return max(matching_scopes, key=len)
+        
+        # Fallback if no matching scope found in DB
+        parts = hn_lower.split('.')
+        if len(parts) >= 2:
+            if len(parts) >= 3 and parts[-2] in ("co", "com", "org", "net", "edu", "gov", "ac"):
+                return ".".join(parts[-3:])
+            return ".".join(parts[-2:])
+        return hn_lower
+
+    base_domain = _get_base_domain(hostname, domain_scopes)
+
     findings_to_create = []
 
     def _adjust_severity(base_sev: str) -> str:
@@ -909,14 +939,16 @@ async def _generate_findings(
 
     # Poor security headers
     if http_result["status"] and http_result["sec_headers_grade"] in ("D", "F"):
+        grade = http_result["sec_headers_grade"]
         findings_to_create.append({
-            "severity": _adjust_severity("medium" if http_result["sec_headers_grade"] == "D" else "high"),
+            "severity": _adjust_severity("medium" if grade == "D" else "high"),
             "source": "ext_scanner",
-            "issue_type": f"Poor Security Headers (Grade {http_result['sec_headers_grade']})",
-            "entity": hostname,
+            "issue_type": "Poor Security Headers",
+            "entity": base_domain,
             "evidence": {
                 "hostname": hostname,
-                "grade": http_result["sec_headers_grade"],
+                "grade": grade,
+                "affected_subdomains": [f"{hostname} (Grade {grade})"],
                 "missing_headers": "CSP, HSTS, X-Frame-Options, X-Content-Type-Options",
             },
         })
@@ -973,9 +1005,10 @@ async def _generate_findings(
             "severity": _adjust_severity("medium"),
             "source": "ext_scanner",
             "issue_type": "Missing DMARC Record",
-            "entity": hostname,
+            "entity": base_domain,
             "evidence": {
                 "hostname": hostname,
+                "affected_subdomains": [hostname],
                 "description": "No DMARC record was found, making the domain vulnerable to email spoofing.",
             },
         })
@@ -984,10 +1017,11 @@ async def _generate_findings(
             "severity": _adjust_severity("low"),
             "source": "ext_scanner",
             "issue_type": "DMARC Policy is 'None'",
-            "entity": hostname,
+            "entity": base_domain,
             "evidence": {
                 "hostname": hostname,
                 "dmarc_record": email_security["dmarc"],
+                "affected_subdomains": [hostname],
                 "description": "DMARC is configured but the policy is set to 'none', meaning spoofed emails are not blocked.",
             },
         })
@@ -997,9 +1031,10 @@ async def _generate_findings(
             "severity": _adjust_severity("medium"),
             "source": "ext_scanner",
             "issue_type": "Missing SPF Record",
-            "entity": hostname,
+            "entity": base_domain,
             "evidence": {
                 "hostname": hostname,
+                "affected_subdomains": [hostname],
                 "description": "No SPF record was found, allowing unauthorized senders to forge emails from this domain.",
             },
         })
@@ -1044,6 +1079,40 @@ async def _generate_findings(
             existing_row.last_seen_at = datetime.now(timezone.utc)
             if existing_row.status == "resolved":
                 existing_row.status = "open"
+
+            # Merge subdomains if it is one of the consolidated issues
+            consolidated_issues = (
+                "Poor Security Headers",
+                "Missing DMARC Record",
+                "DMARC Policy is 'None'",
+                "Missing SPF Record"
+            )
+            if f["issue_type"] in consolidated_issues:
+                from sqlalchemy.orm.attributes import flag_modified
+                current_evidence = dict(existing_row.evidence or {})
+                affected = list(current_evidence.get("affected_subdomains") or [])
+                new_subs = f["evidence"].get("affected_subdomains") or []
+                
+                # Merge subdomains while avoiding exact duplicates
+                for ns in new_subs:
+                    if ns not in affected:
+                        affected.append(ns)
+                
+                current_evidence["affected_subdomains"] = affected
+                
+                if f["issue_type"] == "Poor Security Headers":
+                    # Keep grade F if either is F, otherwise D
+                    current_evidence["grade"] = "F" if (current_evidence.get("grade") == "F" or f["evidence"].get("grade") == "F") else "D"
+                
+                existing_row.evidence = current_evidence
+                flag_modified(existing_row, "evidence")
+                
+                # Promote severity to the highest observed severity
+                sev_hierarchy = {"info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
+                existing_sev = existing_row.severity
+                new_sev = f["severity"]
+                if sev_hierarchy.get(new_sev, 0) > sev_hierarchy.get(existing_sev, 0):
+                    existing_row.severity = new_sev
         else:
             # Get next sequence number (manual since we don't use server-side default)
             from sqlalchemy import func as sqlfunc, text
@@ -1301,6 +1370,22 @@ async def _scan_domain_inner(
 
 
 
+async def _is_job_cancelled(tenant_id: str, job_id: uuid.UUID | None) -> bool:
+    if not job_id:
+        return False
+    try:
+        from app.database import get_tenant_db
+        from sqlalchemy import select as _select
+        async with get_tenant_db(tenant_id) as session:
+            result = await session.execute(_select(ScanJob.status, ScanJob.error_message).where(ScanJob.id == job_id))
+            row = result.first()
+            if row and row[0] == "failed" and row[1] == "Cancelled by user":
+                return True
+    except Exception as e:
+        logger.warning(f"[EASM] Error checking scan job cancel status: {e}")
+    return False
+
+
 async def run_easm_scan(tenant_id: str, scope_values: list[str], modules: list[str] | None = None) -> None:
     """
     Main entry point: scan all domains in the tenant's scope.
@@ -1434,7 +1519,7 @@ async def _run_easm_scan_inner(tenant_id: str, scope_values: list[str], passed_j
                 session.add(job)
                 await session.flush()
                 job_id = job.id
-                logger.info(f"[EASM] Created scan job {job_id} — {len(domains)} hosts to scan")
+                logger.info(f"[EASM] Created scan job {job_id} ── {len(domains)} hosts to scan")
     except Exception as e:
         logger.warning(f"[EASM] Could not update/create scan job record: {e}")
 
@@ -1453,6 +1538,11 @@ async def _run_easm_scan_inner(tenant_id: str, scope_values: list[str], passed_j
             return (domain_to_scan, False)
 
     for i in range(0, len(domains), BATCH_SIZE):
+        # Check if cancelled before starting batch
+        if await _is_job_cancelled(tenant_id, job_id):
+            logger.info(f"[EASM] Scan job {job_id} cancelled by user. Exiting discovery loop.")
+            return
+
         batch = domains[i:i + BATCH_SIZE]
         logger.info(f"[EASM] Scanning batch {i // BATCH_SIZE + 1}/{(len(domains) + BATCH_SIZE - 1) // BATCH_SIZE}: {len(batch)} host(s)")
         
@@ -1475,6 +1565,10 @@ async def _run_easm_scan_inner(tenant_id: str, scope_values: list[str], passed_j
                     result = await session.execute(_select(ScanJob).where(ScanJob.id == job_id))
                     j = result.scalar_one_or_none()
                     if j:
+                        # Don't overwrite if it was cancelled mid-transaction
+                        if j.status == "failed" and j.error_message == "Cancelled by user":
+                            logger.info(f"[EASM] Scan job {job_id} cancelled. Exiting progress update.")
+                            return
                         j.metadata_ = {
                             "targets": scope_values,
                             "all_hosts": domains,
@@ -1494,8 +1588,11 @@ async def _run_easm_scan_inner(tenant_id: str, scope_values: list[str], passed_j
     logger.info(f"[EASM] Asset discovery complete for tenant {tenant_id}: {completed} ok, {failed} failed, {total_subdomains} subdomains found")
 
     # ── Phase 2: Run Nuclei vulnerability scanning separately ─────────────
-    # This runs AFTER all assets are stored, one target at a time,
-    # to prevent memory exhaustion on low-resource servers (512MB Render).
+    # Check if cancelled before starting Nuclei
+    if await _is_job_cancelled(tenant_id, job_id):
+        logger.info(f"[EASM] Scan job {job_id} cancelled by user. Skipping Nuclei phase.")
+        return
+
     nuclei_ok = 0
     nuclei_fail = 0
     try:
@@ -1511,6 +1608,9 @@ async def _run_easm_scan_inner(tenant_id: str, scope_values: list[str], passed_j
                 result = await session.execute(_select(ScanJob).where(ScanJob.id == job_id))
                 j = result.scalar_one_or_none()
                 if j:
+                    if j.status == "failed" and j.error_message == "Cancelled by user":
+                        logger.info(f"[EASM] Scan job {job_id} was cancelled. Not overwriting status.")
+                        return
                     j.status = "completed" if failed == 0 else "failed"
                     j.completed_at = datetime.now(timezone.utc)
                     j.metadata_ = {
@@ -1525,10 +1625,12 @@ async def _run_easm_scan_inner(tenant_id: str, scope_values: list[str], passed_j
                     }
                     if failed > 0:
                         j.error_message = f"{failed} host(s) failed to scan"
+                    await session.commit()
         except Exception as e:
             logger.warning(f"[EASM] Could not update scan job: {e}")
 
     logger.info(f"[EASM] Scan fully complete for tenant {tenant_id}: {completed} ok, {failed} failed, nuclei={nuclei_ok}/{nuclei_ok+nuclei_fail}")
+
 
 # ── Nuclei Vulnerability Scan Phase (runs separately after asset discovery) ────
 
@@ -1537,10 +1639,11 @@ async def _run_nuclei_phase(tenant_id: str, domains: list[str], modules: list[st
     Phase 2 of the EASM scan: Run Nuclei vulnerability scanning.
     
     This runs AFTER all assets have been discovered and stored in the DB.
-    Scans one hostname at a time to keep memory usage under 512MB.
+    Scans in batches of 10 hostnames to balance speed and low memory usage under 512MB.
     Returns (ok_count, fail_count).
     """
     import gc
+    from urllib.parse import urlparse
     
     do_vuln = not modules or "vuln" in modules
     if not do_vuln:
@@ -1557,7 +1660,29 @@ async def _run_nuclei_phase(tenant_id: str, domains: list[str], modules: list[st
     
     logger.info(f"[EASM/Nuclei] Starting vulnerability scan phase for {len(domains)} host(s)")
     
-    for idx, hostname in enumerate(domains):
+    # 1. Helper to extract hostname from matched-at URL
+    def _extract_hostname(matched_at: str, fallback: str) -> str:
+        if not matched_at:
+            return fallback
+        try:
+            parsed = urlparse(matched_at)
+            host = parsed.hostname
+            if host:
+                return host.lower().strip()
+        except Exception:
+            pass
+        return fallback
+
+    # 2. Batch targets in groups of 10
+    NUCLEI_BATCH_SIZE = 10
+    batches = [domains[i:i + NUCLEI_BATCH_SIZE] for i in range(0, len(domains), NUCLEI_BATCH_SIZE)]
+    
+    for batch_idx, batch_domains in enumerate(batches):
+        # Check if cancelled before starting batch
+        if await _is_job_cancelled(tenant_id, job_id):
+            logger.info(f"[EASM/Nuclei] Scan job {job_id} cancelled by user. Exiting Nuclei phase batch {batch_idx + 1}.")
+            break
+
         # Update progress metadata in database
         if job_id:
             try:
@@ -1566,6 +1691,10 @@ async def _run_nuclei_phase(tenant_id: str, domains: list[str], modules: list[st
                     result = await session.execute(_select(ScanJob).where(ScanJob.id == job_id))
                     j = result.scalar_one_or_none()
                     if j:
+                        # Check cancellation once more in transaction context
+                        if j.status == "failed" and j.error_message == "Cancelled by user":
+                            logger.info(f"[EASM/Nuclei] Scan job {job_id} cancelled. Exiting progress update.")
+                            break
                         meta = dict(j.metadata_ or {})
                         meta["phase"] = "vuln"
                         meta["vuln_total"] = len(domains)
@@ -1576,134 +1705,14 @@ async def _run_nuclei_phase(tenant_id: str, domains: list[str], modules: list[st
             except Exception as e:
                 logger.warning(f"[EASM/Nuclei] Could not update scan job progress metadata: {e}")
 
+        batch_targets = set()
+        batch_tech_tags = set()
+        asset_info_map = {}  # hostname -> {"criticality": str}
+        
+        # Load asset details and port details for all domains in batch
         try:
-            # Read the stored asset to get tech_stack and web URLs
             async with get_tenant_db(tenant_id) as session:
-                result = await session.execute(
-                    select(EasmAsset).where(
-                        and_(
-                            EasmAsset.tenant_id == tid,
-                            EasmAsset.hostname == hostname,
-                        )
-                    )
-                )
-                asset = result.scalar_one_or_none()
-                
-                if not asset:
-                    logger.debug(f"[EASM/Nuclei] No asset found for {hostname}, skipping")
-                    ok_count += 1
-                    continue
-                
-                # Parse tech_stack from stored JSON strings
-                tech_stack = []
-                for t in (asset.tech_stack or []):
-                    try:
-                        tech_stack.append(json.loads(t) if isinstance(t, str) else t)
-                    except (json.JSONDecodeError, TypeError):
-                        pass
-                
-                # Build web URLs from stored ports
-                port_result = await session.execute(
-                    select(EasmPort).where(
-                        and_(
-                            EasmPort.tenant_id == tid,
-                            EasmPort.asset_id == asset.id,
-                        )
-                    )
-                )
-                ports = port_result.scalars().all()
-                
-                open_web_urls = set()
-                for p in ports:
-                    if p.service in ("HTTP", "HTTP-Alt", "HTTPS", "HTTPS-Alt"):
-                        scheme = "https" if "HTTPS" in p.service else "http"
-                        open_web_urls.add(f"{scheme}://{hostname}:{p.port}")
-                
-                # Also add default HTTP/HTTPS if asset has an http_status
-                if asset.http_status:
-                    open_web_urls.add(f"https://{hostname}")
-                    open_web_urls.add(f"http://{hostname}")
-                
-                asset_criticality = asset.asset_criticality or "medium"
-            
-            # Skip nuclei running if there are absolutely no open web URLs to target!
-            # Loopback or missing web services will immediately time out.
-            if not open_web_urls:
-                logger.info(f"[EASM/Nuclei] {hostname} has no open web ports. Skipping Nuclei scan.")
-                ok_count += 1
-                continue
-
-            # Build tech tags for Nuclei
-            tech_tags = [t.get("name", "").lower().replace(" ", "-") for t in tech_stack if t.get("name")]
-            
-            # Run Nuclei for this single host (verify() already has the global semaphore)
-            targets = list(open_web_urls)
-            logger.info(f"[EASM/Nuclei] Scanning {hostname} ({len(targets)} URL(s))")
-            
-            raw_nuclei_data = await engine.verify(targets, tags=tech_tags)
-            
-            # Separate tech detections from real vulnerabilities
-            nuclei_findings = []
-            for n in raw_nuclei_data:
-                t_id = str(n.get("template_id", "")).lower()
-                if "wappalyzer" in t_id or t_id.endswith("-detect") or "tech" in t_id:
-                    continue  # Skip tech detections, we already have tech_stack
-                nuclei_findings.append(n)
-
-            
-            # Write Nuclei findings to DB
-            if nuclei_findings:
-                async with get_tenant_db(tenant_id) as session:
-                    # Severity adjustment helper
-                    def _adjust_severity(base_sev: str) -> str:
-                        levels = {"info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
-                        rev_levels = {v: k for k, v in levels.items()}
-                        val = levels.get(base_sev, 2)
-                        if asset_criticality in ("critical", "high"):
-                            val = min(4, val + 1)
-                        elif asset_criticality == "low":
-                            val = max(0, val - 1)
-                        return rev_levels.get(val, base_sev)
-                    
-                    for result_item in nuclei_findings:
-                        issue_type = f"Verified {result_item.get('cve_id', 'Vulnerability')}"
-                        
-                        # Deduplicate: check if finding already exists
-                        existing = await session.execute(
-                            select(Finding).where(
-                                and_(
-                                    Finding.tenant_id == tid,
-                                    Finding.entity == hostname,
-                                    Finding.issue_type == issue_type,
-                                )
-                            )
-                        )
-                        if existing.scalar_one_or_none():
-                            continue
-                        
-                        from sqlalchemy import text as _text
-                        seq_result = await session.execute(_text("SELECT nextval('findings_seq')"))
-                        seq_num = seq_result.scalar()
-
-                        session.add(Finding(
-                            tenant_id=tid,
-                            finding_num=seq_num,
-                            severity=_adjust_severity(result_item.get("severity", "high")),
-                            source="ext_scanner",
-                            issue_type=issue_type,
-                            entity=hostname,
-                            tags=["Verified", "Nuclei"],
-                            evidence={
-                                "hostname": hostname,
-                                "confidence": 95,
-                                "description": result_item.get("description"),
-                                "extracted_results": result_item.get("extracted_results"),
-                                "matched_at": result_item.get("matched_at"),
-                                "template_id": result_item.get("template_id"),
-                            },
-                        ))
-                    
-                    # Update asset cve_count
+                for hostname in batch_domains:
                     result = await session.execute(
                         select(EasmAsset).where(
                             and_(
@@ -1712,24 +1721,161 @@ async def _run_nuclei_phase(tenant_id: str, domains: list[str], modules: list[st
                             )
                         )
                     )
-                    asset_row = result.scalar_one_or_none()
-                    if asset_row:
-                        asset_row.cve_count = (asset_row.cve_count or 0) + len(nuclei_findings)
-                        asset_row.updated_at = datetime.now(timezone.utc)
+                    asset = result.scalar_one_or_none()
+                    if not asset:
+                        continue
                     
-                    await session.commit()
-                
-                logger.info(f"[EASM/Nuclei] {hostname}: found {len(nuclei_findings)} verified vulnerability(ies)")
-            
-            ok_count += 1
-            
+                    asset_info_map[hostname] = {
+                        "criticality": asset.asset_criticality or "medium",
+                        "findings_found": 0
+                    }
+                    
+                    # Tech tags
+                    for t in (asset.tech_stack or []):
+                        try:
+                            obj = json.loads(t) if isinstance(t, str) else t
+                            if obj.get("name"):
+                                batch_tech_tags.add(obj["name"].lower().replace(" ", "-"))
+                        except (json.JSONDecodeError, TypeError):
+                            pass
+                    
+                    # Ports/Web URLs
+                    port_result = await session.execute(
+                        select(EasmPort).where(
+                            and_(
+                                EasmPort.tenant_id == tid,
+                                EasmPort.asset_id == asset.id,
+                            )
+                        )
+                    )
+                    ports = port_result.scalars().all()
+                    
+                    for p in ports:
+                        if p.service in ("HTTP", "HTTP-Alt", "HTTPS", "HTTPS-Alt"):
+                            scheme = "https" if "HTTPS" in p.service else "http"
+                            batch_targets.add(f"{scheme}://{hostname}:{p.port}")
+                    
+                    if asset.http_status:
+                        batch_targets.add(f"https://{hostname}")
+                        batch_targets.add(f"http://{hostname}")
         except Exception as e:
-            logger.error(f"[EASM/Nuclei] Failed for {hostname}: {e}")
-            fail_count += 1
-        
-        # Force garbage collection between each host to free memory
+            logger.error(f"[EASM/Nuclei] Error loading batch assets: {e}")
+            fail_count += len(batch_domains)
+            continue
+            
+        if not batch_targets:
+            logger.info(f"[EASM/Nuclei] Batch {batch_idx + 1} has no open web targets. Skipping.")
+            ok_count += len(batch_domains)
+            continue
+            
+        # Run Nuclei scan for the batch
+        try:
+            targets_list = list(batch_targets)
+            tags_list = list(batch_tech_tags)
+            logger.info(f"[EASM/Nuclei] Batch {batch_idx + 1}/{len(batches)}: Scanning {len(batch_domains)} host(s) via {len(targets_list)} URLs. Tech tags: {tags_list}")
+            
+            raw_nuclei_data = await engine.verify(targets_list, tags=tags_list)
+            
+            # Filter detections
+            nuclei_findings = []
+            for n in raw_nuclei_data:
+                t_id = str(n.get("template_id", "")).lower()
+                if "wappalyzer" in t_id or t_id.endswith("-detect") or "tech" in t_id:
+                    continue
+                nuclei_findings.append(n)
+                
+            # Write findings to DB in batch session
+            if nuclei_findings:
+                async with get_tenant_db(tenant_id) as session:
+                    # Map each finding back to its correct hostname
+                    for result_item in nuclei_findings:
+                        matched_at = result_item.get("matched_at", "")
+                        # Try to resolve to a host in the current batch
+                        finding_host = _extract_hostname(matched_at, batch_domains[0])
+                        
+                        # Find the correct criticality or fallback
+                        host_info = asset_info_map.get(finding_host, {"criticality": "medium"})
+                        asset_criticality = host_info.get("criticality", "medium")
+                        
+                        def _adjust_severity(base_sev: str) -> str:
+                            levels = {"info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
+                            rev_levels = {v: k for k, v in levels.items()}
+                            val = levels.get(base_sev, 2)
+                            if asset_criticality in ("critical", "high"):
+                                val = min(4, val + 1)
+                            elif asset_criticality == "low":
+                                val = max(0, val - 1)
+                            return rev_levels.get(val, base_sev)
+                            
+                        issue_type = f"Verified {result_item.get('cve_id', 'Vulnerability')}"
+                        
+                        # Deduplicate
+                        existing = await session.execute(
+                            select(Finding).where(
+                                and_(
+                                    Finding.tenant_id == tid,
+                                    Finding.entity == finding_host,
+                                    Finding.issue_type == issue_type,
+                                )
+                            )
+                        )
+                        if existing.scalar_one_or_none():
+                            continue
+                            
+                        from sqlalchemy import text as _text
+                        seq_result = await session.execute(_text("SELECT nextval('findings_seq')"))
+                        seq_num = seq_result.scalar()
+                        
+                        session.add(Finding(
+                            tenant_id=tid,
+                            finding_num=seq_num,
+                            severity=_adjust_severity(result_item.get("severity", "high")),
+                            source="ext_scanner",
+                            issue_type=issue_type,
+                            entity=finding_host,
+                            tags=["Verified", "Nuclei"],
+                            evidence={
+                                "hostname": finding_host,
+                                "confidence": 95,
+                                "description": result_item.get("description"),
+                                "extracted_results": result_item.get("extracted_results"),
+                                "matched_at": result_item.get("matched_at"),
+                                "template_id": result_item.get("template_id"),
+                            },
+                        ))
+                        
+                        # Increment finding count for host update
+                        if finding_host in asset_info_map:
+                            asset_info_map[finding_host]["findings_found"] = asset_info_map[finding_host].get("findings_found", 0) + 1
+
+                    # Bulk update asset CVE count
+                    for hname, info in asset_info_map.items():
+                        findings_count = info.get("findings_found", 0)
+                        if findings_count > 0:
+                            result = await session.execute(
+                                select(EasmAsset).where(
+                                    and_(
+                                        EasmAsset.tenant_id == tid,
+                                        EasmAsset.hostname == hname,
+                                    )
+                                )
+                            )
+                            asset_row = result.scalar_one_or_none()
+                            if asset_row:
+                                asset_row.cve_count = (asset_row.cve_count or 0) + findings_count
+                                asset_row.updated_at = datetime.now(timezone.utc)
+                                
+                    await session.commit()
+                    
+            ok_count += len(batch_domains)
+            logger.info(f"[EASM/Nuclei] Batch {batch_idx + 1} done. Found {len(nuclei_findings)} verified vulnerabilities across {len(batch_domains)} hosts.")
+        except Exception as e:
+            logger.error(f"[EASM/Nuclei] Batch {batch_idx + 1} scan failed: {e}")
+            fail_count += len(batch_domains)
+            
+        # Reclaim memory after each batch
         gc.collect()
-    
+        
     logger.info(f"[EASM/Nuclei] Phase complete: {ok_count} ok, {fail_count} failed")
     return (ok_count, fail_count)
 

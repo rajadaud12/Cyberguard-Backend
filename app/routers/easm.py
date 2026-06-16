@@ -630,6 +630,43 @@ async def trigger_rescan(
     }
 
 
+@router.post("/cancel-scan")
+async def cancel_scan(
+    current_user: User = Depends(require_admin),
+    session: AsyncSession = Depends(get_db),
+):
+    """
+    Cancel the currently running EASM scan job.
+    """
+    await set_rls_tenant(session, str(current_user.tenant_id))
+
+    # Find active scan job
+    result = await session.execute(
+        select(ScanJob)
+        .where(
+            and_(
+                ScanJob.tenant_id == current_user.tenant_id,
+                ScanJob.job_type == "easm",
+                ScanJob.status.in_(["queued", "running"])
+            )
+        )
+        .order_by(ScanJob.created_at.desc())
+        .limit(1)
+    )
+    job = result.scalar_one_or_none()
+
+    if not job:
+        raise HTTPException(status_code=400, detail="No active scan job found to cancel.")
+
+    from datetime import datetime, timezone
+    job.status = "failed"
+    job.error_message = "Cancelled by user"
+    job.completed_at = datetime.now(timezone.utc)
+    await session.commit()
+
+    return {"message": "Scan cancelled successfully."}
+
+
 @router.get("/scan-status")
 async def get_scan_status(
     current_user: User = Depends(get_current_user),
