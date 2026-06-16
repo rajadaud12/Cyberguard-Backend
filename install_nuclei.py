@@ -86,10 +86,14 @@ def install_nuclei():
     print("Initializing/downloading Nuclei templates...")
     import subprocess
     try:
-        # Run the binary to download the templates
-        # We also pass -ud to make sure they are stored under the user's home directory normally
-        # or it will download default templates into the default location.
-        result = subprocess.run([target_path, "-update-templates"], capture_output=True, text=True, timeout=180)
+        # Run the binary to download the templates to a local workspace path
+        templates_path = os.path.join("bin", "nuclei-templates")
+        result = subprocess.run(
+            [target_path, "-ud", templates_path, "-update-templates"],
+            capture_output=True,
+            text=True,
+            timeout=180
+        )
         if result.returncode == 0:
             print("Nuclei templates downloaded/updated successfully!")
         else:

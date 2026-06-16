@@ -11,6 +11,10 @@ import shutil
 
 class NucleiVerificationEngine:
     def __init__(self):
+        # Resolve backend root directory (two levels up from app/services/verification_engine.py)
+        self.base_dir = Path(__file__).parent.parent.parent.absolute()
+        self.templates_dir = self.base_dir / "bin" / "nuclei-templates"
+
         # 1. First, check if nuclei is installed globally in the system PATH
         system_nuclei = shutil.which("nuclei")
         if system_nuclei:
@@ -20,7 +24,7 @@ class NucleiVerificationEngine:
             # 2. Fall back to local bin/ folder (nuclei.exe on Windows, nuclei on Linux)
             is_windows = os.name == "nt"
             bin_name = "nuclei.exe" if is_windows else "nuclei"
-            self.nuclei_bin = Path("bin").absolute() / bin_name
+            self.nuclei_bin = self.base_dir / "bin" / bin_name
             if not self.nuclei_bin.exists():
                 logger.warning(f"Nuclei binary not found in bin/ or system PATH at {self.nuclei_bin}")
 
@@ -100,6 +104,9 @@ class NucleiVerificationEngine:
             "-bulk-size", "50",
             "-rate-limit", "100",
         ]
+
+        if self.templates_dir.exists():
+            cmd.extend(["-ud", str(self.templates_dir), "-t", str(self.templates_dir)])
 
         try:
             logger.info(f"Running Nuclei on {target} with tags: {tags}")
