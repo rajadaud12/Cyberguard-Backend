@@ -529,9 +529,10 @@ async def _probe_sensitive_paths(base_url: str, is_catch_all: bool = False) -> l
                 if resp.status_code == 200:
                     content_type = resp.headers.get("Content-Type", "").lower()
                     server_header = resp.headers.get("Server", "").lower()
+                    body_text = resp.text
                     
-                    # Guardrail 1: If an edge firewall or captcha interstitial handled the request, drop it
-                    if "captcha" in server_header or "cloudflare" in server_header:
+                    # Guardrail 1: If a captcha/challenge page, drop it
+                    if "captcha" in body_text.lower() and "challenge" in body_text.lower():
                         return None
                         
                     # Guardrail 2: Backup manifests (.bak, .zip, .old, .sql) are NEVER text/html files
@@ -550,6 +551,20 @@ async def _probe_sensitive_paths(base_url: str, is_catch_all: bool = False) -> l
                                      "severity": signature["severity"],
                                      "url": url,
                                      "matched_keyword": k
+                                 }
+                         
+                         # Fallback: for .env files, check generic KEY=VALUE pattern
+                         if path.startswith("/.env") and "text/html" not in content_type:
+                             import re as _re
+                             # Match lines like KEY=value (at least 3 such lines = likely a real .env)
+                             env_lines = _re.findall(r'^[A-Z][A-Z0-9_]{2,}=.+', body_text, _re.MULTILINE)
+                             if len(env_lines) >= 3:
+                                 return {
+                                     "path": path,
+                                     "type": signature["type"],
+                                     "severity": signature["severity"],
+                                     "url": url,
+                                     "matched_keyword": f"Generic .env ({len(env_lines)} vars detected)"
                                  }
                     
                     # 3. Check pattern matching for dynamically discovered paths

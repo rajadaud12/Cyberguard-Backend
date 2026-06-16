@@ -18,36 +18,80 @@ class NucleiVerificationEngine:
             return []
 
         results = []
-        if tags:
-            # Always include general high-value tags alongside the detected technologies.
-            # We omit 'cve' to avoid running thousands of unrelated CVE templates, 
-            # but we still catch generic exposed files, default logins, and misconfigs.
-            final_tags = set(tags) | {"misconfig", "exposure", "default-login", "takeover"}
-            target_tags = ",".join(final_tags)
+
+        # Normalize targets: scan each URL individually for multi-port hosts
+        if isinstance(target_url, list):
+            targets = target_url
         else:
-            target_tags = "misconfig,exposure,default-login,takeover"
-            
-        target_str = ",".join(target_url) if isinstance(target_url, list) else target_url
-        
-        # Nuclei CLI command
-        # -u: target
-        # -jsonl: JSON lines output
-        # -silent: No extraneous output
-        # -nc: No colors
-        # -tags: comma separated tags to restrict templates
+            targets = [target_url]
+
+        # ── Phase 1: Broad exposure/misconfig scan (high-signal, fast) ──
+        # These tag categories reliably catch .env leaks, exposed panels,
+        # default credentials, misconfigurations, and takeover opportunities.
+        phase1_tags = "exposure,misconfig,default-login,takeover,config,env,file"
+
+        # ── Phase 2: Technology-specific vulnerability scan ──
+        # Use tech-stack detected tags to run targeted CVE/vuln templates.
+        # Filter out garbage tags that would match nothing.
+        VALID_TECH_TAGS = {
+            "nginx", "apache", "iis", "php", "laravel", "wordpress", "joomla",
+            "drupal", "django", "flask", "express", "nodejs", "node", "react",
+            "nextjs", "next.js", "angular", "vue", "nuxt", "tomcat", "spring",
+            "struts", "rails", "ruby", "asp.net", "dotnet", "java", "jenkins",
+            "grafana", "kibana", "elasticsearch", "redis", "mongodb", "mysql",
+            "postgres", "mssql", "oracle", "docker", "kubernetes", "gitlab",
+            "bitbucket", "confluence", "jira", "sonarqube", "rabbitmq",
+            "apache-http-server", "litespeed", "caddy", "openresty", "varnish",
+            "shopify", "magento", "prestashop", "woocommerce", "webflow",
+            "cloudflare", "fastly", "akamai", "aws", "azure", "gcp",
+            "minio", "adminer", "phpmyadmin", "wp-admin",
+        }
+        tech_tags_filtered = [t for t in tags if t in VALID_TECH_TAGS]
+
+        all_results = []
+        for target in targets:
+            # Phase 1: exposure/misconfig scan
+            r1 = await self._run_nuclei(target, phase1_tags)
+            all_results.extend(r1)
+
+            # Phase 2: tech-specific scan (only if we have relevant tags)
+            if tech_tags_filtered:
+                phase2_tags = ",".join(tech_tags_filtered)
+                r2 = await self._run_nuclei(target, phase2_tags)
+                all_results.extend(r2)
+
+        # Deduplicate by template_id + matched_at
+        seen = set()
+        for r in all_results:
+            key = (r.get("template_id", ""), r.get("matched_at", ""))
+            if key not in seen:
+                seen.add(key)
+                results.append(r)
+
+        return results
+
+    async def _run_nuclei(self, target: str, tags: str) -> list[dict]:
+        """Run a single Nuclei scan against a target with given tags."""
+        results = []
+
         cmd = [
             str(self.nuclei_bin),
-            "-u", target_str,
+            "-u", target,
             "-jsonl",
             "-silent",
             "-nc",
-            "-duc",  # Disable update checks which can hang
-            "-tags", target_tags
+            "-duc",           # Disable update checks which can hang
+            "-tags", tags,
+            "-severity", "info,low,medium,high,critical",
+            "-timeout", "10",  # Per-request timeout in seconds
+            "-retries", "1",
+            "-bulk-size", "50",
+            "-rate-limit", "100",
         ]
 
         try:
-            logger.info(f"Running Nuclei verification on {target_url} with tags: {target_tags}")
-            
+            logger.info(f"Running Nuclei on {target} with tags: {tags}")
+
             def run_nuclei():
                 return subprocess.run(
                     cmd,
@@ -55,11 +99,11 @@ class NucleiVerificationEngine:
                     text=True,
                     encoding='utf-8',
                     errors='replace',
-                    timeout=180  # Hard timeout of 3 minutes per run
+                    timeout=300  # Hard timeout of 5 minutes per run
                 )
 
             process = await asyncio.to_thread(run_nuclei)
-            
+
             if process.stdout:
                 for line in process.stdout.splitlines():
                     if not line.strip():
@@ -67,7 +111,7 @@ class NucleiVerificationEngine:
                     try:
                         data = json.loads(line)
                         info = data.get("info", {})
-                        
+
                         results.append({
                             "cve_id": data.get("matcher-name") or info.get("name", "Unknown Issue"),
                             "severity": info.get("severity", "info"),
@@ -79,13 +123,20 @@ class NucleiVerificationEngine:
                         })
                     except json.JSONDecodeError:
                         pass
-                        
+
             if process.stderr:
-                err = process.stderr
-                if err.strip():
-                    logger.debug(f"Nuclei stderr: {err}")
-                    
+                err = process.stderr.strip()
+                if err:
+                    # Only log real errors, not info/progress lines
+                    for line in err.splitlines():
+                        if any(lvl in line for lvl in ["[ERR]", "[FTL]"]):
+                            logger.warning(f"Nuclei error: {line}")
+                        else:
+                            logger.debug(f"Nuclei: {line}")
+
+        except subprocess.TimeoutExpired:
+            logger.warning(f"Nuclei timed out for {target} with tags {tags}")
         except Exception as e:
-            logger.exception(f"Nuclei execution failed for {target_url}")
+            logger.exception(f"Nuclei execution failed for {target}")
 
         return results
