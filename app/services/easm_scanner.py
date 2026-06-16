@@ -1681,8 +1681,13 @@ async def _run_nuclei_phase(tenant_id: str, domains: list[str], modules: list[st
                         if existing.scalar_one_or_none():
                             continue
                         
+                        from sqlalchemy import text as _text
+                        seq_result = await session.execute(_text("SELECT nextval('findings_seq')"))
+                        seq_num = seq_result.scalar()
+
                         session.add(Finding(
                             tenant_id=tid,
+                            finding_num=seq_num,
                             severity=_adjust_severity(result_item.get("severity", "high")),
                             source="ext_scanner",
                             issue_type=issue_type,
