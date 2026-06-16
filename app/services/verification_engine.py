@@ -7,14 +7,26 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+import shutil
+
 class NucleiVerificationEngine:
     def __init__(self):
-        self.nuclei_bin = Path("bin/nuclei.exe").absolute()
-        if not self.nuclei_bin.exists():
-            logger.warning(f"Nuclei binary not found at {self.nuclei_bin}")
+        # 1. First, check if nuclei is installed globally in the system PATH
+        system_nuclei = shutil.which("nuclei")
+        if system_nuclei:
+            self.nuclei_bin = Path(system_nuclei)
+            logger.info(f"Using system-wide Nuclei binary at {self.nuclei_bin}")
+        else:
+            # 2. Fall back to local bin/ folder (nuclei.exe on Windows, nuclei on Linux)
+            is_windows = os.name == "nt"
+            bin_name = "nuclei.exe" if is_windows else "nuclei"
+            self.nuclei_bin = Path("bin").absolute() / bin_name
+            if not self.nuclei_bin.exists():
+                logger.warning(f"Nuclei binary not found in bin/ or system PATH at {self.nuclei_bin}")
 
     async def verify(self, target_url: str | list[str], tags: list[str]) -> list[dict]:
         if not self.nuclei_bin.exists():
+            logger.error("Nuclei binary not found. Skipping verification.")
             return []
 
         results = []
