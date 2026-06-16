@@ -99,10 +99,11 @@ class NucleiVerificationEngine:
             "-duc",           # Disable update checks which can hang
             "-tags", tags,
             "-severity", "info,low,medium,high,critical",
-            "-timeout", "10",  # Per-request timeout in seconds
+            "-timeout", "5",   # Lowered from 10 to release sockets quickly
             "-retries", "1",
-            "-bulk-size", "50",
-            "-rate-limit", "100",
+            "-bulk-size", "5",  # Lowered from 50 to limit parallel hosts
+            "-rate-limit", "25", # Lowered from 100 to prevent network choking
+            "-c", "10",        # Restrict concurrency to 10 (down from 25 default) to save CPU/RAM
         ]
 
         if self.templates_dir.exists():
