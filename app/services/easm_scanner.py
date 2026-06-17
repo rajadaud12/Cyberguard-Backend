@@ -364,18 +364,33 @@ async def _calculate_cve_data(tech_stack: list[dict]) -> list[dict]:
     await cve_service.close()
     return all_cves
 
-async def _test_catch_all(base_url: str) -> bool:
+async def _get_catch_all_details(base_url: str) -> Optional[dict]:
     """
-    Test if the server is a catch-all by requesting a random non-existent path.
+    Request a random non-existent path to get catch-all response details if status is 200.
     """
     random_path = f"cx-{uuid.uuid4().hex[:8]}-random"
     test_url = f"{base_url.rstrip('/')}/{random_path}"
     try:
         resp = await _HTTP_CLIENT.get(test_url)
-        return resp.status_code == 200
+        if resp.status_code == 200:
+            return {
+                "random_path": random_path,
+                "status_code": resp.status_code,
+                "content": resp.content,
+                "headers": dict(resp.headers),
+                "content_type": resp.headers.get("Content-Type", "").lower()
+            }
     except Exception as e:
-        logger.debug(f"Catch-all probe {test_url}: {e}")
-        return False
+        logger.debug(f"Catch-all probe details {test_url}: {e}")
+    return None
+
+
+async def _test_catch_all(base_url: str) -> bool:
+    """
+    Test if the server is a catch-all by requesting a random non-existent path.
+    """
+    details = await _get_catch_all_details(base_url)
+    return details is not None
 
 
 # Load Signatures Dynamically
@@ -497,6 +512,10 @@ async def _probe_sensitive_paths(base_url: str, is_catch_all: bool = False) -> l
     """
     findings = []
     
+    catch_all_details = None
+    if is_catch_all:
+        catch_all_details = await _get_catch_all_details(base_url)
+    
     crawled_paths = await _crawl_links(base_url)
     js_paths = await _analyze_javascript(base_url)
     
@@ -507,7 +526,7 @@ async def _probe_sensitive_paths(base_url: str, is_catch_all: bool = False) -> l
     # Optional: Apply random jitter/delay here or rely on _HTTP_CLIENT concurrency limits
     
     sem = asyncio.Semaphore(15) # Concurrency limit for path probing
-
+ 
     async def _probe(path: str):
         async with sem:
             url = f"{base_url.rstrip('/')}{path}"
@@ -524,7 +543,7 @@ async def _probe_sensitive_paths(base_url: str, is_catch_all: bool = False) -> l
                              "url": url,
                              "matched_keyword": f"Fingerprint: {fp['app']}"
                          }
-
+ 
                 if resp.status_code == 200:
                     content_type = resp.headers.get("Content-Type", "").lower()
                     server_header = resp.headers.get("Server", "").lower()
@@ -538,7 +557,7 @@ async def _probe_sensitive_paths(base_url: str, is_catch_all: bool = False) -> l
                     is_backup_ext = any(path.endswith(ext) for ext in [".bak", ".old", ".zip", ".sql"])
                     if is_backup_ext and "text/html" in content_type:
                         return None
-
+ 
                     # Guardrail 3: Tech-stack mismatch for backend script files (e.g. .php, .asp, .jsp) on JS frameworks
                     is_backend_script = any(path.lower().endswith(ext) for ext in [".php", ".asp", ".aspx", ".jsp", ".jspx", ".cgi"])
                     if is_backend_script:
@@ -558,9 +577,58 @@ async def _probe_sensitive_paths(base_url: str, is_catch_all: bool = False) -> l
                         )
                         if is_js_framework:
                             return None
-
-                    # 2. Check predefined signatures if it's from the wordlist
+ 
+                    # Guardrail 4: Non-HTML files (config, source control, credentials, etc.) are NEVER HTML files
+                    NON_HTML_TYPES = {
+                        "Configuration Exposure",
+                        "Source Control Leak",
+                        "Package Manifest",
+                        "Docker Configuration",
+                        "Backup Exposure",
+                        "Database Dump",
+                        "File Metadata Leak",
+                        "Server Configuration",
+                        "Credential Exposure",
+                        "IIS Configuration",
+                        "Cross-Domain Policy"
+                    }
+                    is_html = "text/html" in content_type or body_text.strip().lower().startswith(("<!doctype html", "<html"))
+                    
                     signature = next((s for s in SENSITIVE_PATH_SIGNATURES if s["path"] == path), None)
+                    if is_html and signature and signature["type"] in NON_HTML_TYPES:
+                        return None
+ 
+                    # Guardrail 5: Catch-all / Wildcard response checks
+                    if catch_all_details:
+                        # Exact content match
+                        if resp.content == catch_all_details["content"]:
+                            return None
+                        
+                        # Replaced path match (in case the requested path is reflected in the catch-all response)
+                        try:
+                            random_path_str = catch_all_details["random_path"]
+                            r_path = f"/{random_path_str.lstrip('/')}"
+                            p_path = f"/{path.lstrip('/')}"
+                            
+                            catch_all_str = catch_all_details["content"].decode('utf-8', errors='ignore')
+                            resp_str = resp.content.decode('utf-8', errors='ignore')
+                            
+                            replaced_str = catch_all_str.replace(r_path, p_path)
+                            replaced_str = replaced_str.replace(random_path_str, path.lstrip('/'))
+                            
+                            if replaced_str == resp_str:
+                                return None
+                        except Exception:
+                            pass
+                            
+                        # Length match with threshold for HTML pages of non-HTML types
+                        if is_html and signature and signature["type"] in NON_HTML_TYPES:
+                            catch_all_len = len(catch_all_details["content"])
+                            resp_len = len(resp.content)
+                            if abs(catch_all_len - resp_len) < max(50, catch_all_len * 0.02):
+                                return None
+ 
+                    # 2. Check predefined signatures if it's from the wordlist
                     if signature:
                          for k in signature["keywords"]:
                              if k.encode('utf-8') in resp.content:
