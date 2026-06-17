@@ -1,3 +1,9 @@
-somathes.com
-http://somathes.com
+http://www.somathes.com:80
 https://somathes.com
+https://somathes.com:8443
+http://somathes.com:8080
+http://www.somathes.com
+http://somathes.com
+https://somathes.com:443
+http://somathes.com:80
+https://www.somathes.com

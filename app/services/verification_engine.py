@@ -83,6 +83,29 @@ class NucleiVerificationEngine:
         logger.info(f"[Nuclei] Pre-filtered templates for folders {folders} and tags {tags}: found {len(matching_paths)} matches")
         return matching_paths
 
+    async def _filter_active_targets(self, targets: list[str]) -> list[str]:
+        """Verify that target URLs are responsive before passing them to Nuclei to prevent hangs."""
+        import httpx
+        
+        active_targets = []
+        async def check_target(url: str):
+            try:
+                # Use a short connect/read timeout to check responsiveness
+                async with httpx.AsyncClient(verify=False, timeout=2.5) as client:
+                    await client.get(url, follow_redirects=False)
+                    return url
+            except Exception as e:
+                logger.warning(f"[Nuclei/PreCheck] Target {url} is unresponsive (skipped): {e}")
+                return None
+
+        # Run checks in parallel
+        tasks = [check_target(t) for t in targets]
+        results = await asyncio.gather(*tasks)
+        active_targets = [r for r in results if r]
+        
+        logger.info(f"[Nuclei/PreCheck] Filtered targets: {len(targets)} input -> {len(active_targets)} active")
+        return active_targets
+
     async def verify(self, target_url: str | list[str], tags: list[str]) -> list[dict]:
         if not self.nuclei_bin.exists():
             logger.error("Nuclei binary not found. Skipping verification.")
@@ -98,6 +121,12 @@ class NucleiVerificationEngine:
                 targets = [target_url]
 
             if not targets:
+                return []
+
+            # Filter out unresponsive targets to prevent Nuclei from hanging/timing out on dead/filtered ports
+            targets = await self._filter_active_targets(targets)
+            if not targets:
+                logger.info("[Nuclei/PreCheck] No responsive targets found. Skipping verification.")
                 return []
 
             # ── Phase 1: Broad exposure/misconfig scan (high-signal, fast) ──

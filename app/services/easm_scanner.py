@@ -1397,9 +1397,9 @@ async def _is_job_cancelled(tenant_id: str, job_id: uuid.UUID | None) -> bool:
         from app.database import get_tenant_db
         from sqlalchemy import select as _select
         async with get_tenant_db(tenant_id) as session:
-            result = await session.execute(_select(ScanJob.status, ScanJob.error_message).where(ScanJob.id == job_id))
+            result = await session.execute(_select(ScanJob.status).where(ScanJob.id == job_id))
             row = result.first()
-            if row and row[0] == "failed" and row[1] == "Cancelled by user":
+            if row and row[0] in ("failed", "completed"):
                 return True
     except Exception as e:
         logger.warning(f"[EASM] Error checking scan job cancel status: {e}")
@@ -1586,8 +1586,8 @@ async def _run_easm_scan_inner(tenant_id: str, scope_values: list[str], passed_j
                     j = result.scalar_one_or_none()
                     if j:
                         # Don't overwrite if it was cancelled mid-transaction
-                        if j.status == "failed" and j.error_message == "Cancelled by user":
-                            logger.info(f"[EASM] Scan job {job_id} cancelled. Exiting progress update.")
+                        if j.status in ("failed", "completed"):
+                            logger.info(f"[EASM] Scan job {job_id} cancelled or finished. Exiting progress update.")
                             return
                         j.metadata_ = {
                             "targets": scope_values,
@@ -1628,8 +1628,8 @@ async def _run_easm_scan_inner(tenant_id: str, scope_values: list[str], passed_j
                 result = await session.execute(_select(ScanJob).where(ScanJob.id == job_id))
                 j = result.scalar_one_or_none()
                 if j:
-                    if j.status == "failed" and j.error_message == "Cancelled by user":
-                        logger.info(f"[EASM] Scan job {job_id} was cancelled. Not overwriting status.")
+                    if j.status in ("failed", "completed"):
+                        logger.info(f"[EASM] Scan job {job_id} was cancelled or finished. Not overwriting status.")
                         return
                     j.status = "completed" if failed == 0 else "failed"
                     j.completed_at = datetime.now(timezone.utc)
@@ -1712,8 +1712,8 @@ async def _run_nuclei_phase(tenant_id: str, domains: list[str], modules: list[st
                     j = result.scalar_one_or_none()
                     if j:
                         # Check cancellation once more in transaction context
-                        if j.status == "failed" and j.error_message == "Cancelled by user":
-                            logger.info(f"[EASM/Nuclei] Scan job {job_id} cancelled. Exiting progress update.")
+                        if j.status in ("failed", "completed"):
+                            logger.info(f"[EASM/Nuclei] Scan job {job_id} cancelled or finished. Exiting progress update.")
                             break
                         meta = dict(j.metadata_ or {})
                         meta["phase"] = "vuln"
