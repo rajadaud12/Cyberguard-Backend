@@ -204,7 +204,15 @@ async def get_easm_overview(
                 except Exception:
                     web_tech_counter[item] += 1
     
-    top_web_techs = [tech for tech, _ in web_tech_counter.most_common(4)]
+    FAMOUS_FRAMEWORKS = {
+        "next.js", "node.js", "react", "vue.js", "angular", "nuxt.js", "laravel", 
+        "django", "ruby on rails", "express", "svelte", "wordpress", "gatsby", "astro"
+    }
+    sorted_techs = sorted(
+        web_tech_counter.items(),
+        key=lambda x: (0 if x[0].lower() in FAMOUS_FRAMEWORKS else 1, -x[1])
+    )
+    top_web_techs = [tech for tech, _ in sorted_techs[:4]]
 
     # 2. Top Email Providers (detect MX/SPF from scopes)
     async def detect_email_provider(domain: str) -> str:
