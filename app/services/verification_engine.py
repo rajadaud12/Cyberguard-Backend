@@ -46,6 +46,7 @@ class NucleiVerificationEngine:
         import os
         import re
         tags_re = re.compile(r'^\s*tags:\s*(.+)$', re.MULTILINE)
+        max_req_re = re.compile(r'max-request:\s*(\d+)', re.IGNORECASE)
         
         for folder in folders:
             folder_path = self.templates_dir / folder
@@ -60,6 +61,13 @@ class NucleiVerificationEngine:
                             # Read first 1500 chars (fast pre-filter)
                             with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
                                 head = f.read(1500).lower()
+                                
+                                # Skip heavy brute force/directory fuzzing templates
+                                max_req_match = max_req_re.search(head)
+                                if max_req_match:
+                                    if int(max_req_match.group(1)) > 50:
+                                        continue
+                                        
                                 match = tags_re.search(head)
                                 if match:
                                     raw_tags = match.group(1).strip().strip('"\'[]{}')
@@ -207,9 +215,9 @@ class NucleiVerificationEngine:
             "-severity", "info,low,medium,high,critical",
             "-timeout", "3",    # Per-request timeout in seconds (optimized down from 5)
             "-retries", "1",
-            "-bulk-size", "2",  # Concurrency settings optimized for Render 512MB RAM
-            "-rate-limit", "25",
-            "-c", "2",
+            "-bulk-size", "25",  # Concurrency settings optimized for speed and memory safety
+            "-rate-limit", "150",
+            "-c", "25",
             "-rsr", "1048576"   # Limit response size read to 1MB to save RAM buffers
         ]
 

@@ -539,6 +539,26 @@ async def _probe_sensitive_paths(base_url: str, is_catch_all: bool = False) -> l
                     if is_backup_ext and "text/html" in content_type:
                         return None
 
+                    # Guardrail 3: Tech-stack mismatch for backend script files (e.g. .php, .asp, .jsp) on JS frameworks
+                    is_backend_script = any(path.lower().endswith(ext) for ext in [".php", ".asp", ".aspx", ".jsp", ".jspx", ".cgi"])
+                    if is_backend_script:
+                        headers_lower = {k.lower(): v.lower() for k, v in resp.headers.items()}
+                        powered_by = headers_lower.get("x-powered-by", "")
+                        server_header_val = headers_lower.get("server", "")
+                        
+                        is_js_framework = (
+                            "next.js" in powered_by or
+                            "nextjs" in powered_by or
+                            "nuxt" in powered_by or
+                            "vercel" in server_header_val or
+                            "netlify" in server_header_val or
+                            "x-nextjs-cache" in headers_lower or
+                            "x-vercel-cache" in headers_lower or
+                            "x-nf-request-id" in headers_lower
+                        )
+                        if is_js_framework:
+                            return None
+
                     # 2. Check predefined signatures if it's from the wordlist
                     signature = next((s for s in SENSITIVE_PATH_SIGNATURES if s["path"] == path), None)
                     if signature:
@@ -1673,8 +1693,8 @@ async def _run_nuclei_phase(tenant_id: str, domains: list[str], modules: list[st
             pass
         return fallback
 
-    # 2. Batch targets in groups of 100
-    NUCLEI_BATCH_SIZE = 100
+    # 2. Batch targets in groups of 15
+    NUCLEI_BATCH_SIZE = 15
     batches = [domains[i:i + NUCLEI_BATCH_SIZE] for i in range(0, len(domains), NUCLEI_BATCH_SIZE)]
     
     for batch_idx, batch_domains in enumerate(batches):
