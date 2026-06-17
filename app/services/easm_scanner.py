@@ -1673,8 +1673,8 @@ async def _run_nuclei_phase(tenant_id: str, domains: list[str], modules: list[st
             pass
         return fallback
 
-    # 2. Batch targets in groups of 10
-    NUCLEI_BATCH_SIZE = 10
+    # 2. Batch targets in groups of 100
+    NUCLEI_BATCH_SIZE = 100
     batches = [domains[i:i + NUCLEI_BATCH_SIZE] for i in range(0, len(domains), NUCLEI_BATCH_SIZE)]
     
     for batch_idx, batch_domains in enumerate(batches):

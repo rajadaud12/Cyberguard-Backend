@@ -31,6 +31,50 @@ class NucleiVerificationEngine:
             if not self.nuclei_bin.exists():
                 logger.warning(f"Nuclei binary not found in bin/ or system PATH at {self.nuclei_bin}")
 
+    def _find_matching_templates(self, folders: list[str], tags: str) -> list[str]:
+        matching_paths = []
+        if not self.templates_dir.exists() or not tags:
+            return []
+            
+        tag_list = [t.strip().lower() for t in tags.split(",") if t.strip()]
+        if not tag_list:
+            return []
+            
+        tag_set = set(tag_list)
+        
+        # Avoid loading thousands of files if possible
+        import os
+        import re
+        tags_re = re.compile(r'^\s*tags:\s*(.+)$', re.MULTILINE)
+        
+        for folder in folders:
+            folder_path = self.templates_dir / folder
+            if not folder_path.exists():
+                continue
+                
+            for root, _, files in os.walk(folder_path):
+                for file in files:
+                    if file.endswith(".yaml") or file.endswith(".yml"):
+                        file_path = os.path.join(root, file)
+                        try:
+                            # Read first 1500 chars (fast pre-filter)
+                            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                                head = f.read(1500).lower()
+                                match = tags_re.search(head)
+                                if match:
+                                    raw_tags = match.group(1).strip().strip('"\'[]{}')
+                                    template_tags = {t.strip().lower() for t in raw_tags.split(",") if t.strip()}
+                                    if tag_set.intersection(template_tags):
+                                        matching_paths.append(file_path)
+                                else:
+                                    # Fallback to simple substring match if tags regex failed to match but 'tags:' is present
+                                    if "tags:" in head and any(t in head for t in tag_set):
+                                        matching_paths.append(file_path)
+                        except Exception:
+                            pass
+        logger.info(f"[Nuclei] Pre-filtered templates for folders {folders} and tags {tags}: found {len(matching_paths)} matches")
+        return matching_paths
+
     async def verify(self, target_url: str | list[str], tags: list[str]) -> list[dict]:
         if not self.nuclei_bin.exists():
             logger.error("Nuclei binary not found. Skipping verification.")
@@ -49,13 +93,20 @@ class NucleiVerificationEngine:
                 return []
 
             # ── Phase 1: Broad exposure/misconfig scan (high-signal, fast) ──
-            # These tag categories reliably catch .env leaks, exposed panels,
-            # default credentials, and takeover opportunities.
             phase1_tags = "exposure,default-login,takeover,env"
+            phase1_paths = self._find_matching_templates(
+                ["http/exposures", "http/default-logins", "http/exposed-panels", "http/takeovers"],
+                phase1_tags
+            )
+            
+            all_results = []
+            if phase1_paths:
+                r1 = await self._run_nuclei_batch(targets, phase1_tags, phase1_paths)
+                all_results.extend(r1)
+            else:
+                logger.info("[Nuclei] No matching Phase 1 templates found. Skipping Phase 1.")
 
             # ── Phase 2: Technology-specific vulnerability scan ──
-            # Use tech-stack detected tags to run targeted CVE/vuln templates.
-            # Filter out garbage tags that would match nothing.
             VALID_TECH_TAGS = {
                 "nginx", "apache", "iis", "php", "laravel", "wordpress", "joomla",
                 "drupal", "django", "flask", "express", "nodejs", "node", "react",
@@ -71,37 +122,18 @@ class NucleiVerificationEngine:
             }
             tech_tags_filtered = [t for t in tags if t in VALID_TECH_TAGS]
 
-            # Phase 1: exposure/misconfig scan (Only load relevant subdirectories to save RAM)
-            phase1_paths = []
-            if self.templates_dir.exists():
-                for d in ["http/exposures", "http/default-logins", "http/exposed-panels", "http/takeovers"]:
-                    p = self.templates_dir / d
-                    if p.exists():
-                        phase1_paths.append(str(p))
-            
-            if not phase1_paths and self.templates_dir.exists():
-                phase1_paths = [str(self.templates_dir)]
-
-            all_results = []
-            r1 = await self._run_nuclei_batch(targets, phase1_tags, phase1_paths)
-            all_results.extend(r1)
-
-            # Phase 2: tech-specific scan (Only load tech stacks & CVEs folders to save RAM)
             if tech_tags_filtered:
                 phase2_tags = ",".join(tech_tags_filtered)
+                phase2_paths = self._find_matching_templates(
+                    ["http/technologies", "http/cves"],
+                    phase2_tags
+                )
                 
-                phase2_paths = []
-                if self.templates_dir.exists():
-                    for d in ["http/technologies", "http/cves"]:
-                        p = self.templates_dir / d
-                        if p.exists():
-                            phase2_paths.append(str(p))
-                
-                if not phase2_paths and self.templates_dir.exists():
-                    phase2_paths = [str(self.templates_dir)]
-
-                r2 = await self._run_nuclei_batch(targets, phase2_tags, phase2_paths)
-                all_results.extend(r2)
+                if phase2_paths:
+                    r2 = await self._run_nuclei_batch(targets, phase2_tags, phase2_paths)
+                    all_results.extend(r2)
+                else:
+                    logger.info(f"[Nuclei] No matching Phase 2 templates found for tags {phase2_tags}. Skipping Phase 2.")
 
             # Deduplicate by template_id + matched_at
             seen = set()
@@ -114,7 +146,10 @@ class NucleiVerificationEngine:
             return results
 
     async def _run_nuclei_batch(self, targets: list[str], tags: str, template_paths: list[str]) -> list[dict]:
-        """Run a single Nuclei scan against multiple targets written to a file with given tags."""
+        """Run Nuclei scans against targets by batching templates in groups of 100 to prevent OOM."""
+        if not template_paths:
+            return []
+
         import tempfile
 
         # Ensure temp directory exists under backend root or uses system temp safely
@@ -127,7 +162,26 @@ class NucleiVerificationEngine:
                 for target in targets:
                     f.write(f"{target}\n")
             
-            results = await self._run_nuclei(temp_file_path, tags, template_paths)
+            # Batch template paths in groups of 100 to prevent OOM on Render
+            TEMPLATE_BATCH_SIZE = 100
+            template_batches = [template_paths[i:i + TEMPLATE_BATCH_SIZE] for i in range(0, len(template_paths), TEMPLATE_BATCH_SIZE)]
+            
+            results = []
+            for idx, batch_paths in enumerate(template_batches):
+                fd_t, temp_templates_path = tempfile.mkstemp(suffix=f"_nuclei_templates_b{idx}.txt", dir=str(temp_dir))
+                try:
+                    with os.fdopen(fd_t, 'w', encoding='utf-8') as f_t:
+                        for path in batch_paths:
+                            f_t.write(f"{path}\n")
+                    
+                    batch_results = await self._run_nuclei(temp_file_path, tags, temp_templates_path)
+                    results.extend(batch_results)
+                finally:
+                    try:
+                        os.remove(temp_templates_path)
+                    except Exception:
+                        pass
+                        
             return results
         finally:
             try:
@@ -135,8 +189,8 @@ class NucleiVerificationEngine:
             except Exception:
                 pass
 
-    async def _run_nuclei(self, targets_file: str, tags: str, template_paths: list[str]) -> list[dict]:
-        """Run Nuclei command line tool using a targets file input."""
+    async def _run_nuclei(self, targets_file: str, tags: str, templates_file: str) -> list[dict]:
+        """Run Nuclei command line tool using a targets file and a templates list file input."""
         results = []
 
         cmd = [
@@ -153,18 +207,17 @@ class NucleiVerificationEngine:
             "-severity", "info,low,medium,high,critical",
             "-timeout", "3",    # Per-request timeout in seconds (optimized down from 5)
             "-retries", "1",
-            "-bulk-size", "3",  # Dynamic batching per template
-            "-rate-limit", "25", # Safe network rate-limit limit
-            "-c", "3",          # Concurrency limit (safe for 512MB RAM but faster than 2)
+            "-bulk-size", "2",  # Concurrency settings optimized for Render 512MB RAM
+            "-rate-limit", "25",
+            "-c", "2",
+            "-rsr", "1048576"   # Limit response size read to 1MB to save RAM buffers
         ]
 
-        if self.templates_dir.exists():
-            for path in template_paths:
-                cmd.extend(["-t", path])
+        if templates_file:
+            cmd.extend(["-t", templates_file])
 
         try:
             logger.info(f"Running Nuclei batch scan with tags: {tags}")
-
 
             def run_nuclei():
                 return subprocess.run(
