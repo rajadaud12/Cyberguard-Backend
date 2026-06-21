@@ -2059,6 +2059,23 @@ async def _run_nuclei_phase(tenant_id: str, domains: list[str], modules: list[st
                                 
                             # If the crawler organically found a sensitive file that isn't in our signatures, flag it!
                             if any(cp.lower().endswith(ext) for ext in sensitive_exts):
+                                issue_type = f"Exposed Sensitive File: Config/Backup ({cp.split('/')[-1]})"
+                                existing = await session.execute(
+                                    select(Finding).where(
+                                        and_(
+                                            Finding.tenant_id == tid,
+                                            Finding.entity == hostname,
+                                            Finding.issue_type == issue_type
+                                        )
+                                    )
+                                )
+                                existing_row = existing.scalars().first()
+                                if existing_row:
+                                    existing_row.last_seen_at = datetime.now(timezone.utc)
+                                    if existing_row.status == "resolved":
+                                        existing_row.status = "open"
+                                    continue
+
                                 from sqlalchemy import text as _text
                                 seq_result = await session.execute(_text("SELECT nextval('findings_seq')"))
                                 seq_num = seq_result.scalar()
@@ -2067,7 +2084,7 @@ async def _run_nuclei_phase(tenant_id: str, domains: list[str], modules: list[st
                                     finding_num=seq_num,
                                     severity="high",
                                     source="ext_scanner",
-                                    issue_type=f"Exposed Sensitive File: Config/Backup ({cp.split('/')[-1]})",
+                                    issue_type=issue_type,
                                     entity=hostname,
                                     tags=["Verified", "Crawler"],
                                     evidence={
@@ -2127,6 +2144,12 @@ async def _run_nuclei_phase(tenant_id: str, domains: list[str], modules: list[st
                     # Map each finding back to its correct hostname
                     for result_item in nuclei_findings:
                         matched_at = result_item.get("matched_at", "")
+                        t_id = str(result_item.get("template_id", "")).lower()
+
+                        if result_item.get("severity", "info").lower() == "info":
+                            if not any(k in t_id for k in ("exposure", "api", "leak", "metric")):
+                                continue
+
                         # Try to resolve to a host in the current batch
                         finding_host = _extract_hostname(matched_at, batch_domains[0])
                         
@@ -2156,7 +2179,27 @@ async def _run_nuclei_phase(tenant_id: str, domains: list[str], modules: list[st
                                 )
                             )
                         )
-                        if existing.scalar_one_or_none():
+                        existing_row = existing.scalars().first()
+                        if existing_row:
+                            existing_row.last_seen_at = datetime.now(timezone.utc)
+                            if existing_row.status == "resolved":
+                                existing_row.status = "open"
+                            
+                            # Merge matched_at URLs if Nuclei found it on multiple paths
+                            current_evidence = dict(existing_row.evidence or {})
+                            matched_urls = current_evidence.get("matched_at", [])
+                            if isinstance(matched_urls, str):
+                                matched_urls = [matched_urls]
+                            elif not isinstance(matched_urls, list):
+                                matched_urls = []
+                                
+                            new_match = result_item.get("matched_at")
+                            if new_match and new_match not in matched_urls:
+                                matched_urls.append(new_match)
+                                current_evidence["matched_at"] = matched_urls
+                                existing_row.evidence = current_evidence
+                                from sqlalchemy.orm.attributes import flag_modified
+                                flag_modified(existing_row, "evidence")
                             continue
                             
                         from sqlalchemy import text as _text

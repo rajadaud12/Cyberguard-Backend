@@ -54,18 +54,12 @@ class NucleiVerificationEngine:
         max_req_re = re.compile(r'max-request:\s*(\d+)', re.IGNORECASE)
 
         for folder in folders:
-            if len(matching_paths) >= MAX_TEMPLATES_PER_PHASE:
-                break
             folder_path = self.templates_dir / folder
             if not folder_path.exists():
                 continue
 
             for root, _, files in os.walk(folder_path):
-                if len(matching_paths) >= MAX_TEMPLATES_PER_PHASE:
-                    break
                 for file in files:
-                    if len(matching_paths) >= MAX_TEMPLATES_PER_PHASE:
-                        break
                     if file.endswith(".yaml") or file.endswith(".yml"):
                         file_path = os.path.join(root, file)
                         try:
@@ -76,7 +70,7 @@ class NucleiVerificationEngine:
                                 # Skip heavy brute force/directory fuzzing templates
                                 max_req_match = max_req_re.search(head)
                                 if max_req_match:
-                                    if int(max_req_match.group(1)) > 50:
+                                    if int(max_req_match.group(1)) > 100:
                                         continue
 
                                 match = tags_re.search(head)
@@ -92,7 +86,22 @@ class NucleiVerificationEngine:
                         except Exception:
                             pass
 
-        logger.info(f"[Nuclei] Pre-filtered templates for folders {folders} and tags {tags}: found {len(matching_paths)} matches (cap={MAX_TEMPLATES_PER_PHASE})")
+        # Prioritize high-value templates so they aren't dropped by the cap
+        def _score(p):
+            p_lower = p.lower()
+            score = 0
+            if "api" in p_lower: score -= 10
+            if "config" in p_lower: score -= 10
+            if "env" in p_lower: score -= 10
+            if "token" in p_lower: score -= 10
+            if "default" in p_lower: score -= 5
+            if "panel" in p_lower: score -= 5
+            if "cve" in p_lower: score -= 5
+            return (score, p)
+
+        matching_paths.sort(key=_score)
+        
+        logger.info(f"[Nuclei] Pre-filtered templates for folders {folders} and tags {tags}: found {len(matching_paths)} matches.")
         return matching_paths
 
     async def _filter_active_targets(self, targets: list[str]) -> list[str]:
@@ -208,8 +217,7 @@ class NucleiVerificationEngine:
                 ["dast"],
                 phase3_tags
             )
-            # Hard cap DAST at 20 templates — DAST templates are heavier per request
-            phase3_paths = phase3_paths[:20]
+            # Let _run_nuclei_batch chunk the DAST templates
 
             if phase3_paths:
                 r3 = await self._run_nuclei_batch(targets, phase3_tags, phase3_paths, is_dast=True)
@@ -324,11 +332,12 @@ class NucleiVerificationEngine:
     async def _run_nuclei(self, targets_file: str, tags: str, batch_paths: list[str], is_dast: bool = False) -> list[dict]:
         """Run Nuclei command line tool using a targets file and explicit -t template paths."""
         results = []
+        export_file = f"{targets_file}.json"
 
         cmd = [
             str(self.nuclei_bin).replace(chr(92), '/'),
             "-list", targets_file.replace(chr(92), '/'),
-            "-jsonl",
+            "-json-export", export_file.replace(chr(92), '/'),
             "-silent",
             "-nc",
             "-duc",             # Disable update checks which can hang
@@ -344,15 +353,16 @@ class NucleiVerificationEngine:
             "-rsr", "1048576"   # Limit response size read to 1MB to save RAM buffers
         ]
 
-        if is_dast:
-            cmd.append("-dast")
-
+        # The -dast flag causes Nuclei to ignore our explicitly batched -t templates
+        # so we rely strictly on the batch_paths which point to the dast templates
+        
         # Pass each template path as a separate -t argument
         for path in batch_paths:
             cmd.extend(["-t", path.replace(chr(92), '/')])
 
         try:
             logger.info(f"[Nuclei] Running batch scan | tags={tags} | templates={len(batch_paths)}")
+            logger.debug(f"[Nuclei DEBUG] Command: {' '.join(cmd)}")
 
             def run_nuclei():
                 return subprocess.run(
@@ -366,26 +376,33 @@ class NucleiVerificationEngine:
 
             process = await asyncio.to_thread(run_nuclei)
 
-            if process.stdout:
-                for line in process.stdout.splitlines():
-                    if not line.strip():
-                        continue
+            
+            # Read from the JSON export file
+            export_file = f"{targets_file}.json"
+            if os.path.exists(export_file):
+                try:
+                    with open(export_file, 'r', encoding='utf-8') as f:
+                        export_data = json.load(f)
+                        if isinstance(export_data, list):
+                            for data in export_data:
+                                logger.debug(f"[Nuclei DEBUG] Raw finding: {data.get('template-id')} at {data.get('matched-at')}")
+                                info = data.get("info", {})
+                                results.append({
+                                    "cve_id": data.get("matcher-name") or info.get("name", "Unknown Issue"),
+                                    "severity": info.get("severity", "info"),
+                                    "description": info.get("description", "Verified by Nuclei"),
+                                    "extracted_results": data.get("extracted-results", []),
+                                    "matched_at": data.get("matched-at"),
+                                    "template_id": data.get("template-id"),
+                                    "curl_command": data.get("curl-command")
+                                })
+                except Exception as e:
+                    logger.warning(f"[Nuclei] Failed to read JSON export file: {e}")
+                finally:
                     try:
-                        data = json.loads(line)
-                        info = data.get("info", {})
-
-                        results.append({
-                            "cve_id": data.get("matcher-name") or info.get("name", "Unknown Issue"),
-                            "severity": info.get("severity", "info"),
-                            "description": info.get("description", "Verified by Nuclei"),
-                            "extracted_results": data.get("extracted-results", []),
-                            "matched_at": data.get("matched-at"),
-                            "template_id": data.get("template-id"),
-                            "curl_command": data.get("curl-command")
-                        })
-                    except json.JSONDecodeError:
+                        os.unlink(export_file)
+                    except OSError:
                         pass
-
             if process.stderr:
                 err = process.stderr.strip()
                 if err:

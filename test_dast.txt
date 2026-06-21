@@ -1,1 +1,0 @@
-D:/CyberGuard/backend/bin/nuclei-templates/dast/vulnerabilities/xss/csp-bypass/vk-api-csp-bypass.yaml
