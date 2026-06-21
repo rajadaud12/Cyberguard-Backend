@@ -129,16 +129,33 @@ class NucleiVerificationEngine:
                 logger.info("[Nuclei/PreCheck] No responsive targets found. Skipping verification.")
                 return []
 
+            # Split targets to optimize scans:
+            # Phase 1 & 2 run directory-level checks (like /wp-config.php) so they only need base URLs or directories.
+            # Running them on every single API endpoint causes exponential slowdowns.
+            from urllib.parse import urlparse
+            base_targets = set()
+            for t in targets:
+                parsed = urlparse(t)
+                path = parsed.path
+                if not path or path == '/' or path.endswith('/'):
+                    base_targets.add(t)
+                
+                # Ensure we always have the root base URL
+                root_url = f"{parsed.scheme}://{parsed.netloc}/"
+                base_targets.add(root_url)
+            
+            base_targets = list(base_targets)
+
             # ── Phase 1: Broad exposure/misconfig scan (high-signal, fast) ──
-            phase1_tags = "exposure,default-login,takeover,env"
+            phase1_tags = "exposure,default-login,takeover,env,misconfig,config,backup,auth,dump,metrics"
             phase1_paths = self._find_matching_templates(
-                ["http/exposures", "http/default-logins", "http/exposed-panels", "http/takeovers"],
+                ["http/exposures", "http/default-logins", "http/exposed-panels", "http/takeovers", "http/misconfiguration"],
                 phase1_tags
             )
             
             all_results = []
             if phase1_paths:
-                r1 = await self._run_nuclei_batch(targets, phase1_tags, phase1_paths)
+                r1 = await self._run_nuclei_batch(base_targets, phase1_tags, phase1_paths)
                 all_results.extend(r1)
             else:
                 logger.info("[Nuclei] No matching Phase 1 templates found. Skipping Phase 1.")
@@ -167,10 +184,24 @@ class NucleiVerificationEngine:
                 )
                 
                 if phase2_paths:
-                    r2 = await self._run_nuclei_batch(targets, phase2_tags, phase2_paths)
+                    r2 = await self._run_nuclei_batch(base_targets, phase2_tags, phase2_paths)
                     all_results.extend(r2)
                 else:
                     logger.info(f"[Nuclei] No matching Phase 2 templates found for tags {phase2_tags}. Skipping Phase 2.")
+
+            # ── Phase 3: DAST (Dynamic Application Security Testing) ──
+            # Run DAST templates if DAST paths/tags are requested or generally for comprehensive checks
+            phase3_tags = "dast,sqli,xss,ssti,lfi,rce,injection,idor,redirect"
+            phase3_paths = self._find_matching_templates(
+                ["dast"],
+                phase3_tags
+            )
+            
+            if phase3_paths:
+                r3 = await self._run_nuclei_batch(targets, phase3_tags, phase3_paths, is_dast=True)
+                all_results.extend(r3)
+            else:
+                logger.info("[Nuclei] No matching Phase 3 templates found. Skipping Phase 3.")
 
             # Deduplicate by template_id + matched_at
             seen = set()
@@ -182,7 +213,7 @@ class NucleiVerificationEngine:
 
             return results
 
-    async def _run_nuclei_batch(self, targets: list[str], tags: str, template_paths: list[str]) -> list[dict]:
+    async def _run_nuclei_batch(self, targets: list[str], tags: str, template_paths: list[str], is_dast: bool = False) -> list[dict]:
         """Run Nuclei scans against targets by batching templates in groups of 100 to prevent OOM."""
         if not template_paths:
             return []
@@ -209,9 +240,9 @@ class NucleiVerificationEngine:
                 try:
                     with os.fdopen(fd_t, 'w', encoding='utf-8') as f_t:
                         for path in batch_paths:
-                            f_t.write(f"{path}\n")
+                            f_t.write(f"{path.replace(chr(92), '/')}\n")
                     
-                    batch_results = await self._run_nuclei(temp_file_path, tags, temp_templates_path)
+                    batch_results = await self._run_nuclei(temp_file_path, tags, temp_templates_path, is_dast, batch_paths)
                     results.extend(batch_results)
                 finally:
                     try:
@@ -226,13 +257,13 @@ class NucleiVerificationEngine:
             except Exception:
                 pass
 
-    async def _run_nuclei(self, targets_file: str, tags: str, templates_file: str) -> list[dict]:
+    async def _run_nuclei(self, targets_file: str, tags: str, templates_file: str, is_dast: bool = False, batch_paths: list[str] = None) -> list[dict]:
         """Run Nuclei command line tool using a targets file and a templates list file input."""
         results = []
 
         cmd = [
-            str(self.nuclei_bin),
-            "-list", targets_file,
+            str(self.nuclei_bin).replace(chr(92), '/'),
+            "-list", targets_file.replace(chr(92), '/'),
             "-jsonl",
             "-silent",
             "-nc",
@@ -240,18 +271,29 @@ class NucleiVerificationEngine:
             "-ni",              # Disable Interactsh (OAST) to prevent polling delays/hangs
             "-no-stdin",        # Disable stdin processing to prevent hanging in background
             "-mhe", "5",        # Max host errors before skipping host to save time
-            "-tags", tags,
             "-severity", "info,low,medium,high,critical",
             "-timeout", "3",    # Per-request timeout in seconds (optimized down from 5)
+        ]
+        
+        if not is_dast and tags:
+            cmd.extend(["-tags", tags])
+
+        cmd.extend([
             "-retries", "1",
             "-bulk-size", "25",  # Concurrency settings optimized for speed and memory safety
             "-rate-limit", "150",
             "-c", "25",
             "-rsr", "1048576"   # Limit response size read to 1MB to save RAM buffers
-        ]
+        ])
+        
+        if is_dast:
+            cmd.append("-dast")
 
-        if templates_file:
-            cmd.extend(["-t", templates_file])
+        if batch_paths:
+            for path in batch_paths:
+                cmd.extend(["-t", path.replace(chr(92), '/')])
+        elif templates_file:
+            cmd.extend(["-t", templates_file.replace(chr(92), '/')])
 
         try:
             logger.info(f"Running Nuclei batch scan with tags: {tags}")

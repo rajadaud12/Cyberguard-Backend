@@ -24,7 +24,7 @@ router = APIRouter(prefix="/api/v1/easm", tags=["EASM"])
 
 # ── helpers ────────────────────────────────────────────────────────────────────
 
-def _asset_to_dict(a: EasmAsset) -> dict:
+def _asset_to_dict(a: EasmAsset, findings: list = None) -> dict:
     import json
     parsed_stack = []
     for item in (a.tech_stack or []):
@@ -50,6 +50,7 @@ def _asset_to_dict(a: EasmAsset) -> dict:
         "is_catch_all": a.is_catch_all,
         "is_exposed_admin": a.is_exposed_admin,
         "last_seen_at": a.last_seen_at.isoformat() if a.last_seen_at else None,
+        "issues": findings or [],
     }
 
 
@@ -75,6 +76,7 @@ def _cert_to_dict(c: EasmCertificate) -> dict:
         "valid_to": c.valid_to.isoformat() if c.valid_to else None,
         "is_expired": c.is_expired,
         "is_self_signed": c.is_self_signed,
+        "is_mismatch": getattr(c, "is_mismatch", False),
         "days_to_expiry": c.days_to_expiry,
         "sans": c.sans or [],
     }
@@ -545,8 +547,25 @@ async def get_easm_assets(
 
     total, assets = await asyncio.gather(fetch_total(), fetch_page())
 
+    from collections import defaultdict
+    from app.models.finding import Finding
+    findings_map = defaultdict(list)
+    if assets:
+        hostnames = [a.hostname for a in assets]
+        async with get_tenant_db(str(current_user.tenant_id)) as db:
+            findings_q = select(Finding.entity, Finding.issue_type, Finding.severity).where(
+                and_(
+                    Finding.tenant_id == current_user.tenant_id,
+                    Finding.status == "open",
+                    Finding.entity.in_(hostnames)
+                )
+            )
+            findings_res = await db.execute(findings_q)
+            for entity, issue_type, severity in findings_res.all():
+                findings_map[entity].append({"issue_type": issue_type, "severity": severity})
+
     return {
-        "assets": [_asset_to_dict(a) for a in assets],
+        "assets": [_asset_to_dict(a, findings_map.get(a.hostname, [])) for a in assets],
         "total": total,
         "page": page,
         "per_page": per_page,
@@ -699,7 +718,24 @@ async def get_easm_subdomains(
 
     total, assets = await asyncio.gather(fetch_total(), fetch_page())
 
-    def _subdomain_to_dict(a: EasmAsset) -> dict:
+    from collections import defaultdict
+    from app.models.finding import Finding
+    findings_map = defaultdict(list)
+    if assets:
+        hostnames = [a.hostname for a in assets]
+        async with get_tenant_db(str(current_user.tenant_id)) as db:
+            findings_q = select(Finding.entity, Finding.issue_type, Finding.severity, Finding.evidence).where(
+                and_(
+                    Finding.tenant_id == current_user.tenant_id,
+                    Finding.status == "open",
+                    Finding.entity.in_(hostnames)
+                )
+            )
+            findings_res = await db.execute(findings_q)
+            for entity, issue_type, severity, evidence in findings_res.all():
+                findings_map[entity].append({"issue_type": issue_type, "severity": severity, "evidence": evidence})
+
+    def _subdomain_to_dict(a: EasmAsset, findings: list = None) -> dict:
         import json
         parsed_stack = []
         for item in (a.tech_stack or []):
@@ -725,10 +761,11 @@ async def get_easm_subdomains(
             "cve_count": a.cve_count,
             "discovered_at": a.discovered_at.isoformat() if a.discovered_at else None,
             "last_seen_at": a.last_seen_at.isoformat() if a.last_seen_at else None,
+            "issues": findings or [],
         }
 
     return {
-        "subdomains": [_subdomain_to_dict(a) for a in assets],
+        "subdomains": [_subdomain_to_dict(a, findings_map.get(a.hostname, [])) for a in assets],
         "total": total,
         "page": page,
         "per_page": per_page,

@@ -211,23 +211,39 @@ async def add_scope(
     if existing.scalar_one_or_none():
         raise HTTPException(status_code=409, detail=f"Scope '{scope_value}' already exists.")
 
-    token = generate_verification_token() if body.type == "domain" else None
+    is_subdomain_of_verified = False
+    if body.type == "domain":
+        parents = await session.execute(
+            select(ScanScope).where(
+                and_(
+                    ScanScope.tenant_id == current_user.tenant_id,
+                    ScanScope.type == "domain",
+                    ScanScope.verified == True
+                )
+            )
+        )
+        for p in parents.scalars().all():
+            if scope_value.endswith("." + p.value):
+                is_subdomain_of_verified = True
+                break
+
+    is_verified = (body.type == "cidr") or is_subdomain_of_verified
+    token = generate_verification_token() if body.type == "domain" and not is_verified else None
+    
     scope = ScanScope(
         tenant_id=current_user.tenant_id,
         type=body.type,
         value=scope_value,
-        verified=(body.type == "cidr"),
+        verified=is_verified,
         verification_token=token,
+        verified_at=datetime.now(timezone.utc) if is_verified else None
     )
     session.add(scope)
     await session.flush()
 
-    # Immediately trigger EASM scan for new scope (domain or CIDR)
-    background_tasks.add_task(run_easm_scan, str(current_user.tenant_id), [scope_value])
-
     return {
         "scope": _scope_dict(scope),
-        "message": f"'{scope_value}' added. EASM scan started.",
+        "message": f"'{scope_value}' added to scope.",
     }
 
 
@@ -274,10 +290,7 @@ async def update_scope(
     # Delete old EASM data for old hostname/cidr
     await _delete_scope_data(session, current_user.tenant_id, scope.type, old_value)
 
-    # Re-scan new value
-    background_tasks.add_task(run_easm_scan, str(current_user.tenant_id), [body.value])
-
-    return {"scope": _scope_dict(scope), "message": f"Updated to '{body.value}'. Rescan started."}
+    return {"scope": _scope_dict(scope), "message": f"Updated to '{body.value}'."}
 
 
 @router.delete("/scopes/{scope_id}", status_code=204)

@@ -69,7 +69,7 @@ def generate_totp_qr_base64(email: str, secret: str) -> str:
     qr.make(fit=True)
     img = qr.make_image(fill_color="white", back_color="#0F0F0F")
     buffer = BytesIO()
-    img.save(buffer, format="PNG")
+    img.save(buffer, format="PNG")  # type: ignore
     buffer.seek(0)
     encoded = base64.b64encode(buffer.getvalue()).decode("utf-8")
     return f"data:image/png;base64,{encoded}"

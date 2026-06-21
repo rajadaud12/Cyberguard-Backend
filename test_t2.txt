@@ -1,0 +1,1 @@
+d:\CyberGuard\backend\bin\nuclei-templates\http\exposures\configs\git-config.yaml

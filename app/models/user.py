@@ -1,11 +1,16 @@
 """User ORM Model"""
 import uuid
 from datetime import datetime
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 from sqlalchemy import String, Boolean, DateTime, ForeignKey, func
 from sqlalchemy.dialects.postgresql import UUID, ENUM
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.database import Base
+
+if TYPE_CHECKING:
+    from app.models.tenant import Tenant
+    from app.models.audit_trail import AuditTrail
+
 
 
 class User(Base):

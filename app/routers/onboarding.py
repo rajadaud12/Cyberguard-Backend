@@ -84,16 +84,35 @@ async def add_scope(
             continue
         
         # Generate verification token for domains
-        verification_token = None
+        is_subdomain_of_verified = False
         if item.type == "domain":
+            parents = await session.execute(
+                select(ScanScope).where(
+                    and_(
+                        ScanScope.tenant_id == current_user.tenant_id,
+                        ScanScope.type == "domain",
+                        ScanScope.verified == True
+                    )
+                )
+            )
+            for p in parents.scalars().all():
+                if item.value.endswith("." + p.value):
+                    is_subdomain_of_verified = True
+                    break
+
+        verification_token = None
+        is_verified = (item.type == "cidr") or is_subdomain_of_verified
+        
+        if item.type == "domain" and not is_verified:
             verification_token = generate_verification_token()
         
         scope = ScanScope(
             tenant_id=current_user.tenant_id,
             type=item.type,
             value=item.value,
-            verified=(item.type == "cidr"),  # CIDRs don't need DNS verification
+            verified=is_verified,
             verification_token=verification_token,
+            verified_at=datetime.now(timezone.utc) if is_verified else None
         )
         session.add(scope)
         await session.flush()

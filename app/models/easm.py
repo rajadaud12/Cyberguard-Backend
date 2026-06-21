@@ -88,6 +88,7 @@ class EasmCertificate(Base):
     valid_to = Column(DateTime(timezone=True), nullable=True)
     is_expired = Column(Boolean, nullable=False, default=False)
     is_self_signed = Column(Boolean, nullable=False, default=False)
+    is_mismatch = Column(Boolean, nullable=False, default=False)
     days_to_expiry = Column(Integer, nullable=True)
     sans = Column(ARRAY(Text), nullable=False, default=list)
     discovered_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))

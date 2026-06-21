@@ -1,10 +1,19 @@
 """Tenant ORM Model"""
 import uuid
 from datetime import datetime
+from typing import TYPE_CHECKING
 from sqlalchemy import String, DateTime, Integer, func
 from sqlalchemy.dialects.postgresql import UUID, ENUM
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.database import Base
+
+if TYPE_CHECKING:
+    from app.models.user import User
+    from app.models.scan_scope import ScanScope
+    from app.models.m365_credential import M365Credential
+    from app.models.audit_trail import AuditTrail
+    from app.models.scan_job import ScanJob
+
 
 
 class Tenant(Base):

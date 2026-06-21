@@ -39,6 +39,9 @@ from bs4 import BeautifulSoup
 
 import httpx
 from cryptography import x509
+import dns.asyncresolver
+import random
+import string
 from sqlalchemy import select, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -98,6 +101,8 @@ COMMON_PORTS = [
     (8080,  "HTTP-Alt",   "medium"),
     (8443,  "HTTPS-Alt",  "low"),
     (27017, "MongoDB",    "critical"),
+    (3003,  "HTTP-Alt",   "medium"),
+    (3004,  "HTTP-Alt",   "medium"),
 ]
 
 # Ports that are risky when publicly internet-reachable
@@ -451,6 +456,24 @@ async def _crawl_links(base_url: str) -> set[str]:
                         path = parts[1].strip()
                         if path and path.startswith("/"):
                             paths.add(path)
+        
+        # Recursive Directory Listing Check
+        # Check if any paths look like directories (e.g. /ftp, /backup) and see if they list files
+        dirs_to_check = {p for p in paths if not "." in p.split("/")[-1]}
+        for dir_path in list(dirs_to_check)[:10]: # Limit to avoid excessive requests
+            dir_url = f"{base_url.rstrip('/')}{dir_path}"
+            if not dir_url.endswith("/"):
+                dir_url += "/"
+            dir_resp = await _HTTP_CLIENT.get(dir_url)
+            if dir_resp.status_code == 200 and ("Index of" in dir_resp.text or "listing directory" in dir_resp.text.lower()):
+                paths.add(f"{dir_path.rstrip('/')}/") # Add the explicit directory path
+                soup = BeautifulSoup(dir_resp.content, "html.parser")
+                for a in soup.find_all("a", href=True):
+                    href = a["href"]
+                    if href and not href.startswith("?") and not href.startswith("/"):
+                        # Reconstruct full path
+                        full_path = f"{dir_path.rstrip('/')}/{href}"
+                        paths.add(full_path)
                             
         # Crawl sitemap.xml
         sitemap_url = f"{base_url.rstrip('/')}/sitemap.xml"
@@ -477,8 +500,8 @@ async def _analyze_javascript(base_url: str) -> set[str]:
         soup = BeautifulSoup(resp.content, "html.parser")
         js_links = [script["src"] for script in soup.find_all("script", src=True)]
         
-        # Limit to first 2 JS bundles to save time
-        for js_link in js_links[:2]:
+        # Limit to first 10 JS bundles to save time but still catch main logic
+        for js_link in js_links[:10]:
             if js_link.startswith("/"):
                 js_url = f"{base_url.rstrip('/')}{js_link}"
             elif js_link.startswith("http"):
@@ -486,15 +509,22 @@ async def _analyze_javascript(base_url: str) -> set[str]:
                     continue # Skip external JS
                 js_url = js_link
             else:
-                continue
+                js_url = f"{base_url.rstrip('/')}/{js_link}"
 
             try:
                 js_resp = await _HTTP_CLIENT.get(js_url)
                 if js_resp.status_code == 200:
-                    content = js_resp.text[:50000] # Read only first 50KB
+                    content = js_resp.text[:5000000] # Read up to 5MB
                     # Look for hardcoded API routes, staging URLs, cloud buckets
-                    for match in re.findall(r'[\'"](/(?:api|v[1-9]|admin|staging)[a-zA-Z0-9_\-\/]+)[\'"]', content):
-                        paths.add(match)
+                    # Capture broad common patterns for SPAs
+                    for match in re.findall(r'[\'"](?:/(?:api|rest|b2b|admin|ftp|v[1-9]|staging)[a-zA-Z0-9_\-\/]*)[\'"]', content):
+                        paths.add(match.strip("\'\""))
+                        
+                    # Extract SPA router paths (e.g. path: 'score-board')
+                    for match in re.findall(r'path\s*:\s*[\'"]([^\'"]+)[\'"]', content):
+                        if match and not match.startswith("*"):
+                            paths.add(f"/{match.strip('/')}")
+                            paths.add(f"/#/{match.strip('/')}")
                     for match in re.findall(r'https://[a-zA-Z0-9-]+\.s3\.amazonaws\.com', content):
                          paths.add(match) # Note: this is a full URL, we might need to handle it differently if returning paths
             except Exception as e:
@@ -693,6 +723,52 @@ async def _probe_sensitive_paths(base_url: str, is_catch_all: bool = False) -> l
             findings.append(r)
             found_paths.add(r["path"])
             
+    # Lightweight Fuzzing for Unhandled Exceptions / Error Disclosure
+    try:
+        # Extract base endpoints to fuzz (avoiding static files)
+        fuzz_targets = set()
+        for path in all_paths_to_probe:
+            if not any(path.lower().endswith(ext) for ext in [".js", ".css", ".png", ".jpg", ".gif", ".ico", ".svg", ".woff", ".ttf", ".txt", ".bak"]):
+                fuzz_targets.add(path.split("?")[0]) # Remove existing queries
+                
+        # Inject malformed payload to trigger 500
+        fuzz_payload = "?id=1'\""
+        
+        async def _fuzz(path: str):
+            async with sem:
+                url = f"{base_url.rstrip('/')}{path}{fuzz_payload}"
+                try:
+                    resp = await _HTTP_CLIENT.get(url)
+                    if resp.status_code >= 500:
+                        content_lower = resp.text.lower()
+                        # Look for stack trace signatures
+                        if "traceback (most recent call last)" in content_lower or \
+                           "at /" in content_lower or \
+                           "node_modules" in content_lower or \
+                           "fatal error" in content_lower or \
+                           "java.lang." in content_lower:
+                            return {
+                                "path": path,
+                                "type": "Error Disclosure",
+                                "severity": "low",
+                                "url": url,
+                                "matched_keyword": "Stack Trace Exposure"
+                            }
+                except Exception:
+                    pass
+                return None
+
+        # Only fuzz a random sample to avoid excessive requests
+        sample_targets = list(fuzz_targets)[:20]
+        fuzz_tasks = [_fuzz(p) for p in sample_targets]
+        fuzz_results = await asyncio.gather(*fuzz_tasks)
+        for r in fuzz_results:
+            if r and r["path"] not in found_paths:
+                findings.append(r)
+                found_paths.add(r["path"])
+    except Exception as e:
+        logger.error(f"Fuzzing failed: {e}")
+
     # Add external bucket findings from JS analysis
     for bucket in [p for p in js_paths if p.startswith("http")]:
         findings.append({
@@ -784,6 +860,23 @@ async def _probe_tls(hostname: str) -> Optional[dict]:
 
         is_self_signed = cert.issuer == cert.subject
 
+        # Hostname matching check
+        import fnmatch
+        def match_domain(target: str, pattern: str) -> bool:
+            if not pattern: return False
+            if pattern.startswith("*."):
+                base = pattern[2:]
+                parts = target.split('.')
+                return len(parts) > 0 and '.'.join(parts[1:]).lower() == base.lower()
+            return target.lower() == pattern.lower()
+
+        is_mismatch = True
+        if match_domain(hostname, subject_name):
+            is_mismatch = False
+        for san in sans:
+            if match_domain(hostname, san):
+                is_mismatch = False
+
         return {
             "issuer": issuer,
             "subject": subject_name,
@@ -791,6 +884,7 @@ async def _probe_tls(hostname: str) -> Optional[dict]:
             "valid_to": valid_to,
             "is_expired": is_expired,
             "is_self_signed": is_self_signed,
+            "is_mismatch": is_mismatch,
             "days_to_expiry": days_to_expiry,
             "sans": sans,
         }
@@ -985,8 +1079,32 @@ async def _generate_findings(
             },
         })
 
+    # Missing SSL Certificate
+    if not cert_info and http_result.get("status"):
+        findings_to_create.append({
+            "severity": _adjust_severity("high"),
+            "source": "ext_scanner",
+            "issue_type": "Missing SSL Certificate",
+            "entity": hostname,
+            "evidence": {
+                "hostname": hostname,
+                "description": "The server responded to HTTP requests but no valid TLS certificate could be extracted. The server is likely lacking SSL configuration or port 443 is inaccessible.",
+            },
+        })
+    elif cert_info and cert_info.get("issuer") == "Missing":
+        findings_to_create.append({
+            "severity": _adjust_severity("high"),
+            "source": "ext_scanner",
+            "issue_type": "Missing SSL Certificate",
+            "entity": hostname,
+            "evidence": {
+                "hostname": hostname,
+                "description": "The server responded to HTTP requests but no valid TLS certificate could be extracted. The server is likely lacking SSL configuration or port 443 is inaccessible.",
+            },
+        })
+
     # Expired TLS certificate
-    if cert_info and cert_info["is_expired"]:
+    elif cert_info and cert_info["is_expired"]:
         findings_to_create.append({
             "severity": _adjust_severity("medium"),
             "source": "ext_scanner",
@@ -1025,6 +1143,21 @@ async def _generate_findings(
             "evidence": {
                 "hostname": hostname,
                 "issuer": cert_info["issuer"],
+            },
+        })
+
+    # Hostname mismatch
+    if cert_info and cert_info.get("is_mismatch"):
+        findings_to_create.append({
+            "severity": _adjust_severity("medium"),
+            "source": "ext_scanner",
+            "issue_type": "SSL Certificate Hostname Mismatch",
+            "entity": hostname,
+            "evidence": {
+                "hostname": hostname,
+                "subject": cert_info["subject"],
+                "sans": cert_info["sans"],
+                "description": "The server returned an SSL certificate that does not cover this hostname.",
             },
         })
 
@@ -1265,7 +1398,7 @@ async def _scan_domain_inner(
 
     active_ports = COMMON_PORTS if do_ports else []
     if do_ports and hostname in ("127.0.0.1", "localhost", "::1", "0.0.0.0"):
-        active_ports = [p for p in COMMON_PORTS if p[0] not in (3000, 8000)]
+        active_ports = [p for p in COMMON_PORTS if p[0] not in (3000, 3001, 8000)]
 
     port_tasks = {
         (port, svc, risk): asyncio.create_task(_guarded_port(hostname, port))
@@ -1291,13 +1424,33 @@ async def _scan_domain_inner(
             scheme = "https" if "HTTPS" in svc else "http"
             open_web_urls.add(f"{scheme}://{hostname}:{port}")
 
-    # Sensitive path probe
+    # Sensitive path probe and tech stack augmentation
     sensitive_findings = []
     if do_web:
+        all_tech = { json.dumps(t, sort_keys=True) for t in http_result.get("tech_stack", []) }
         for web_url in open_web_urls:
+            # Tech stack & fallback status
+            if web_url != http_result.get("final_url"):
+                try:
+                    resp = await _HTTP_CLIENT.get(web_url)
+                    techs = _detect_tech_stack(str(resp.url), dict(resp.headers), resp.text)
+                    for t in techs:
+                        all_tech.add(json.dumps(t, sort_keys=True))
+                    
+                    if not http_result.get("status"):
+                        http_result["status"] = resp.status_code
+                        http_result["sec_headers_grade"] = _grade_security_headers(dict(resp.headers))
+                        http_result["final_url"] = str(resp.url)
+                        http_result["is_catch_all"] = await _test_catch_all(web_url)
+                except Exception:
+                    pass
+            
+            # Sensitive path probe
             is_catch = await _test_catch_all(web_url)
             findings = await _probe_sensitive_paths(web_url, is_catch_all=is_catch)
             sensitive_findings.extend(findings)
+        
+        http_result["tech_stack"] = [json.loads(t) for t in all_tech]
         
     # Email security probe
     do_email = (not modules or "email" in modules) and not _is_ip(hostname)
@@ -1371,7 +1524,7 @@ async def _scan_domain_inner(
             session.add(asset)
         await session.flush()
 
-        # \u2500\u2500 Upsert easm_certificates \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+        # ── Upsert easm_certificates ──────────────────────────────────────────────────────────
         if cert_info:
             existing_cert = await session.execute(
                 select(EasmCertificate).where(
@@ -1388,6 +1541,7 @@ async def _scan_domain_inner(
                 cert_row.valid_to = cert_info["valid_to"]
                 cert_row.is_expired = cert_info["is_expired"]
                 cert_row.is_self_signed = cert_info["is_self_signed"]
+                cert_row.is_mismatch = cert_info.get("is_mismatch", False)
                 cert_row.days_to_expiry = cert_info["days_to_expiry"]
                 cert_row.sans = cert_info["sans"]
                 cert_row.updated_at = datetime.now(timezone.utc)
@@ -1402,11 +1556,12 @@ async def _scan_domain_inner(
                     valid_to=cert_info["valid_to"],
                     is_expired=cert_info["is_expired"],
                     is_self_signed=cert_info["is_self_signed"],
+                    is_mismatch=cert_info.get("is_mismatch", False),
                     days_to_expiry=cert_info["days_to_expiry"],
                     sans=cert_info["sans"],
                 ))
 
-        # \u2500\u2500 Upsert easm_ports \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+        # ── Upsert easm_ports ──────────────────────────────────────────────────────────
         risky_open: list[tuple[int, str, str]] = []
         for (port, svc, risk), is_open in port_results.items():
             if not is_open:
@@ -1520,7 +1675,21 @@ async def run_easm_scan(tenant_id: str, scope_values: list[str], modules: list[s
         logger.info(f"[EASM] Scan already running for tenant {tenant_id}, queuing this scan...")
         
     async with lock:
-        await _run_easm_scan_inner(tenant_id, scope_values, passed_job_id=job_id, modules=modules)
+        try:
+            await _run_easm_scan_inner(tenant_id, scope_values, passed_job_id=job_id, modules=modules)
+        except Exception as e:
+            logger.error(f"[EASM] Scan job {job_id} failed with unexpected error: {e}")
+            if job_id:
+                try:
+                    async with get_tenant_db(tenant_id) as session:
+                        from sqlalchemy import select as _select
+                        result = await session.execute(_select(ScanJob).where(ScanJob.id == job_id))
+                        job = result.scalar_one_or_none()
+                        if job and job.status in ("queued", "running"):
+                            job.status = "failed"
+                            await session.commit()
+                except Exception as inner_e:
+                    logger.error(f"[EASM] Could not mark job {job_id} as failed: {inner_e}")
 
 
 async def _run_easm_scan_inner(tenant_id: str, scope_values: list[str], passed_job_id: uuid.UUID | None = None, modules: list[str] | None = None) -> None:
@@ -1842,14 +2011,84 @@ async def _run_nuclei_phase(tenant_id: str, domains: list[str], modules: list[st
                     )
                     ports = port_result.scalars().all()
                     
+                    # Collect base URLs that actually have ports
+                    web_urls = set()
                     for p in ports:
                         if p.service in ("HTTP", "HTTP-Alt", "HTTPS", "HTTPS-Alt"):
                             scheme = "https" if "HTTPS" in p.service else "http"
-                            batch_targets.add(f"{scheme}://{hostname}:{p.port}")
+                            web_urls.add(f"{scheme}://{hostname}:{p.port}")
                     
-                    if asset.http_status:
-                        batch_targets.add(f"https://{hostname}")
-                        batch_targets.add(f"http://{hostname}")
+                    if not web_urls and asset.http_status:
+                        web_urls.add(f"https://{hostname}")
+                        web_urls.add(f"http://{hostname}")
+                        
+                    for w in web_urls:
+                        batch_targets.add(w)
+                        
+                    # Also feed discovered sensitive endpoints to Nuclei for deep fuzzing
+                    finding_result = await session.execute(
+                        select(Finding).where(
+                            and_(
+                                Finding.tenant_id == tid,
+                                Finding.entity == hostname,
+                                Finding.issue_type.like("Exposed Sensitive File:%")
+                            )
+                        )
+                    )
+                    for f in finding_result.scalars().all():
+                        if f.evidence and f.evidence.get("url"):
+                            batch_targets.add(f.evidence.get("url"))
+                            
+                    # Quickly crawl to find normal endpoints to feed to DAST
+                    for w_url in web_urls:
+                        crawled_paths = await _crawl_links(w_url)
+                        js_paths = await _analyze_javascript(w_url)
+                        
+                        valid_dast_targets = []
+                        sensitive_exts = {".bak", ".env", ".yml", ".yaml", ".sql", ".db", ".sqlite", ".log", ".kdbx", ".pem", ".key", ".config"}
+                        for cp in crawled_paths.union(js_paths):
+                            # Ensure any directory paths found are explicitly passed so Nuclei Phase 1 can test them
+                            if cp.endswith("/"):
+                                batch_targets.add(f"{w_url.rstrip('/')}{cp}")
+                                continue
+                                
+                            # If the crawler organically found a sensitive file that isn't in our signatures, flag it!
+                            if any(cp.lower().endswith(ext) for ext in sensitive_exts):
+                                from sqlalchemy import text as _text
+                                seq_result = await session.execute(_text("SELECT nextval('findings_seq')"))
+                                seq_num = seq_result.scalar()
+                                session.add(Finding(
+                                    tenant_id=tid,
+                                    finding_num=seq_num,
+                                    severity="high",
+                                    source="ext_scanner",
+                                    issue_type=f"Exposed Sensitive File: Config/Backup ({cp.split('/')[-1]})",
+                                    entity=hostname,
+                                    tags=["Verified", "Crawler"],
+                                    evidence={
+                                        "hostname": hostname,
+                                        "confidence": 95,
+                                        "description": f"An organically crawled file with a sensitive extension was discovered: {w_url.rstrip('/')}{cp}",
+                                        "url": f"{w_url.rstrip('/')}{cp}",
+                                    },
+                                    status="open"
+                                ))
+                                if hostname in asset_info_map:
+                                    asset_info_map[hostname]["findings_found"] = asset_info_map[hostname].get("findings_found", 0) + 1
+                                
+                            # Skip client-side hash fragments (Nuclei doesn't run headless browser to parse them)
+                            if "#" in cp:
+                                continue
+                            # Skip static files which are useless to fuzz with SQLi/XSS
+                            static_exts = {".js", ".css", ".png", ".jpg", ".jpeg", ".gif", ".ico", ".svg", ".woff", ".woff2", ".ttf", ".eot", ".map"}
+                            if any(cp.lower().endswith(ext) for ext in static_exts):
+                                continue
+                            valid_dast_targets.append(cp)
+                            
+                        # Sort to prioritize API paths and limit to 15 to prevent 15+ minute scans
+                        valid_dast_targets.sort(key=lambda x: 0 if "/api" in x or "/rest" in x else 1)
+                        for cp in valid_dast_targets[:15]:
+                            batch_targets.add(f"{w_url.rstrip('/')}{cp}")
         except Exception as e:
             logger.error(f"[EASM/Nuclei] Error loading batch assets: {e}")
             fail_count += len(batch_domains)
@@ -1976,9 +2215,10 @@ async def _run_nuclei_phase(tenant_id: str, domains: list[str], modules: list[st
 
 async def _enumerate_subdomains(root_domain: str) -> list[str]:
     """
-    Passively aggregate subdomains from multiple public sources:
+    Passively and actively aggregate subdomains:
       1. crt.sh — Certificate Transparency log search
       2. HackerTarget — Passive DNS / IP lookup
+      3. Active Brute-forcing — dnspython resolver
     Returns a deduplicated list of subdomains (not including the root itself).
     """
     subdomains: set[str] = set()
@@ -1986,6 +2226,7 @@ async def _enumerate_subdomains(root_domain: str) -> list[str]:
     results = await asyncio.gather(
         _crtsh_subdomains(root_domain),
         _hackertarget_subdomains(root_domain),
+        _active_subdomain_bruteforce(root_domain),
         return_exceptions=True,
     )
 
@@ -2007,6 +2248,68 @@ async def _enumerate_subdomains(root_domain: str) -> list[str]:
     clean.discard(root_domain)
     logger.info(f"[EASM] crt.sh+HackerTarget found {len(clean)} unique subdomains for {root_domain}")
     return sorted(clean)
+
+
+async def _check_wildcard_dns(domain: str, resolver: dns.asyncresolver.Resolver) -> bool:
+    """Check if the domain has a wildcard DNS record by querying a random non-existent subdomain."""
+    random_sub = f"wildcard-test-{uuid.uuid4().hex[:8]}.{domain}"
+    try:
+        await resolver.resolve(random_sub, 'A')
+        return True
+    except Exception:
+        return False
+
+async def _active_subdomain_bruteforce(root_domain: str) -> list[str]:
+    """
+    Actively brute-force subdomains using dnspython and a wordlist.
+    """
+    import os
+    subdomains: set[str] = set()
+    wordlist_path = os.path.join(os.path.dirname(__file__), "..", "data", "subdomains_wordlist.txt")
+    
+    if not os.path.exists(wordlist_path):
+        logger.warning(f"[EASM] Wordlist not found at {wordlist_path}")
+        return []
+
+    try:
+        with open(wordlist_path, "r") as f:
+            words = [line.strip().lower() for line in f if line.strip()]
+    except Exception as e:
+        logger.error(f"[EASM] Error reading wordlist: {e}")
+        return []
+
+    resolver = dns.asyncresolver.Resolver()
+    resolver.timeout = 1.5
+    resolver.lifetime = 1.5
+
+    # Check for wildcard DNS first
+    has_wildcard = await _check_wildcard_dns(root_domain, resolver)
+    if has_wildcard:
+        logger.info(f"[EASM] Wildcard DNS detected for {root_domain}. Skipping brute-force to avoid false positives.")
+        return []
+
+    logger.info(f"[EASM] Starting active brute-force for {root_domain} with {len(words)} words...")
+
+    sem = asyncio.Semaphore(50)
+
+    async def check_sub(word: str):
+        sub = f"{word}.{root_domain}"
+        async with sem:
+            try:
+                await resolver.resolve(sub, 'A')
+                return sub
+            except Exception:
+                return None
+
+    tasks = [asyncio.create_task(check_sub(w)) for w in words]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    for res in results:
+        if isinstance(res, str):
+            subdomains.add(res)
+
+    logger.info(f"[EASM] Active brute-force found {len(subdomains)} subdomains for {root_domain}")
+    return list(subdomains)
 
 
 async def _crtsh_subdomains(domain: str) -> list[str]:

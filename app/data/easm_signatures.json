@@ -69,7 +69,9 @@
     {"path": "/wp-config.php.bak", "severity": "critical", "type": "Configuration Exposure", "keywords": ["DB_NAME", "DB_USER", "DB_PASSWORD"]},
     {"path": "/wp-config.php.old", "severity": "critical", "type": "Configuration Exposure", "keywords": ["DB_NAME", "DB_USER", "DB_PASSWORD"]},
     {"path": "/.htaccess", "severity": "medium", "type": "Server Configuration", "keywords": ["RewriteEngine", "RewriteRule", "AuthType"]},
-    {"path": "/.htpasswd", "severity": "critical", "type": "Credential Exposure", "keywords": [":"]}
+    {"path": "/.htpasswd", "severity": "critical", "type": "Credential Exposure", "keywords": [":"]},
+    {"path": "/metrics", "severity": "medium", "type": "Monitoring Exposure", "keywords": ["go_gc_duration_seconds", "process_cpu_seconds_total", "http_requests_total", "TYPE"]},
+    {"path": "/.well-known/security.txt", "severity": "low", "type": "Security Policy Exposure", "keywords": ["Contact:", "Expires:"]}
   ],
   "suspicious_patterns": [
     {"regex": "\\.(bak|old|zip|sql|env|tar\\.gz|swp|orig|save|conf|cfg)$", "severity": "high", "type": "Suspicious Extension"},
