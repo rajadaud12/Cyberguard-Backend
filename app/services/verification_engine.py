@@ -313,7 +313,7 @@ class NucleiVerificationEngine:
         cmd = [
             str(self.nuclei_bin).replace(chr(92), '/'),
             "-list", targets_file.replace(chr(92), '/'),
-            "-t", templates_file.replace(chr(92), '/'),
+            "-tl", templates_file.replace(chr(92), '/'),
             "-jsonl",
             "-silent",
             "-nc",
