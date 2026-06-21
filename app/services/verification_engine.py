@@ -190,18 +190,22 @@ class NucleiVerificationEngine:
                     logger.info(f"[Nuclei] No matching Phase 2 templates found for tags {phase2_tags}. Skipping Phase 2.")
 
             # ── Phase 3: DAST (Dynamic Application Security Testing) ──
-            # Run DAST templates if DAST paths/tags are requested or generally for comprehensive checks
-            phase3_tags = "dast,sqli,xss,lfi,idor"
-            phase3_paths = self._find_matching_templates(
-                ["dast"],
-                phase3_tags
-            )
-            
-            if phase3_paths:
-                r3 = await self._run_nuclei_batch(targets, phase3_tags, phase3_paths, is_dast=True)
-                all_results.extend(r3)
+            # Run DAST templates ONLY if DAST tags are explicitly requested
+            dast_keywords = {"dast", "sqli", "xss", "lfi", "idor"}
+            if any(t.lower() in dast_keywords for t in tags):
+                phase3_tags = "dast,sqli,xss,lfi,idor"
+                phase3_paths = self._find_matching_templates(
+                    ["dast"],
+                    phase3_tags
+                )
+                
+                if phase3_paths:
+                    r3 = await self._run_nuclei_batch(targets, phase3_tags, phase3_paths, is_dast=True)
+                    all_results.extend(r3)
+                else:
+                    logger.info("[Nuclei] No matching Phase 3 templates found. Skipping Phase 3.")
             else:
-                logger.info("[Nuclei] No matching Phase 3 templates found. Skipping Phase 3.")
+                logger.info("[Nuclei] DAST tags not explicitly requested. Skipping Phase 3.")
 
             # Deduplicate by template_id + matched_at
             seen = set()

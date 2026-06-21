@@ -1,0 +1,9 @@
+http://www.somathes.com/api/
+http://www.somathes.com/
+http://mail.somathes.com
+http://mail.somathes.com/api/
+http://ftp.somathes.com:80/api/
+http://www.somathes.com
+http://ftp.somathes.com:80
+http://mail.somathes.com/
+http://ftp.somathes.com:80/
