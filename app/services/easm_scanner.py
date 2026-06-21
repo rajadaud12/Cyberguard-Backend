@@ -2016,7 +2016,12 @@ async def _run_nuclei_phase(tenant_id: str, domains: list[str], modules: list[st
                     for p in ports:
                         if p.service in ("HTTP", "HTTP-Alt", "HTTPS", "HTTPS-Alt"):
                             scheme = "https" if "HTTPS" in p.service else "http"
-                            web_urls.add(f"{scheme}://{hostname}:{p.port}")
+                            port_num = p.port
+                            # Strip default ports to produce clean URLs Nuclei can handle
+                            if (scheme == "https" and port_num == 443) or (scheme == "http" and port_num == 80):
+                                web_urls.add(f"{scheme}://{hostname}")
+                            else:
+                                web_urls.add(f"{scheme}://{hostname}:{port_num}")
                     
                     if not web_urls and asset.http_status:
                         web_urls.add(f"https://{hostname}")
@@ -2107,11 +2112,12 @@ async def _run_nuclei_phase(tenant_id: str, domains: list[str], modules: list[st
             
             raw_nuclei_data = await engine.verify(targets_list, tags=tags_list)
             
-            # Filter detections
+            # Filter detections — only skip pure tech-detection templates with no security value
             nuclei_findings = []
             for n in raw_nuclei_data:
                 t_id = str(n.get("template_id", "")).lower()
-                if "wappalyzer" in t_id or t_id.endswith("-detect") or "tech" in t_id:
+                # Skip wappalyzer-style pure tech-detect templates (no vuln)
+                if "wappalyzer" in t_id or t_id.endswith("-detect"):
                     continue
                 nuclei_findings.append(n)
                 
