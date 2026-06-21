@@ -211,7 +211,81 @@ class NucleiVerificationEngine:
                     seen.add(key)
                     results.append(r)
 
+            # Post-process to filter out catch-all false positives
+            results = await self._filter_catch_all_findings(results)
+
             return results
+
+    async def _filter_catch_all_findings(self, findings: list[dict]) -> list[dict]:
+        """Post-process findings to remove false positives caused by path or subdomain catch-alls."""
+        import httpx
+        import uuid
+        from urllib.parse import urlparse
+
+        filtered = []
+        
+        async def verify_finding(finding: dict):
+            matched_url = finding.get("matched_at", "")
+            if not matched_url or not matched_url.startswith("http"):
+                return finding
+                
+            parsed = urlparse(matched_url)
+            
+            async with httpx.AsyncClient(verify=False, timeout=5.0) as client:
+                # 1. Check Path Catch-All
+                # If the finding is on a specific path (not root), verify it's not a path catch-all
+                if parsed.path and parsed.path != "/":
+                    random_path = uuid.uuid4().hex
+                    catch_all_url = f"{parsed.scheme}://{parsed.netloc}/{random_path}"
+                    try:
+                        resp = await client.get(matched_url, follow_redirects=False)
+                        catch_all_resp = await client.get(catch_all_url, follow_redirects=False)
+                        
+                        if resp.status_code == catch_all_resp.status_code:
+                            len1 = len(resp.text)
+                            len2 = len(catch_all_resp.text)
+                            # Allow 10% variance in content length
+                            if max(len1, len2) > 0 and abs(len1 - len2) / max(len1, len2) < 0.10:
+                                logger.info(f"[Nuclei/PostCheck] Filtered finding {finding.get('template_id')} at {matched_url} due to PATH catch-all.")
+                                return None
+                    except Exception as e:
+                        logger.debug(f"[Nuclei/PostCheck] Path check failed for {matched_url}: {e}")
+                
+                # 2. Check Subdomain Catch-All (Wildcard DNS)
+                # If the netloc has subdomains, check a random subdomain
+                parts = parsed.netloc.split('.')
+                # Only check if it looks like a subdomain (at least 3 parts, e.g., webmail.domain.com)
+                if len(parts) > 2 and not parts[-1].isdigit():  # Basic check to avoid IPs
+                    # Handle port if present
+                    host_parts = parts[0].split(':')
+                    sub_prefix = host_parts[0]
+                    
+                    random_sub = uuid.uuid4().hex[:8]
+                    # Reconstruct the wildcard netloc: random_sub + . + domain.com
+                    wildcard_netloc = f"{random_sub}.{'.'.join(parts[1:])}"
+                    wildcard_url = f"{parsed.scheme}://{wildcard_netloc}{parsed.path}"
+                    
+                    try:
+                        resp = await client.get(matched_url, follow_redirects=False)
+                        wildcard_resp = await client.get(wildcard_url, follow_redirects=False)
+                        
+                        if resp.status_code == wildcard_resp.status_code:
+                            len1 = len(resp.text)
+                            len2 = len(wildcard_resp.text)
+                            if max(len1, len2) > 0 and abs(len1 - len2) / max(len1, len2) < 0.10:
+                                logger.info(f"[Nuclei/PostCheck] Filtered finding {finding.get('template_id')} at {matched_url} due to SUBDOMAIN catch-all.")
+                                return None
+                    except Exception as e:
+                        logger.debug(f"[Nuclei/PostCheck] Subdomain check failed for {matched_url}: {e}")
+                        
+            return finding
+
+        # Process all findings in parallel
+        tasks = [verify_finding(f) for f in findings]
+        verified_results = await asyncio.gather(*tasks)
+        filtered = [r for r in verified_results if r]
+        
+        return filtered
 
     async def _run_nuclei_batch(self, targets: list[str], tags: str, template_paths: list[str], is_dast: bool = False) -> list[dict]:
         """Run Nuclei scans against targets by batching templates in groups of 100 to prevent OOM."""
@@ -275,9 +349,6 @@ class NucleiVerificationEngine:
             "-timeout", "3",    # Per-request timeout in seconds (optimized down from 5)
         ]
         
-        if not is_dast and tags:
-            cmd.extend(["-tags", tags])
-
         cmd.extend([
             "-retries", "1",
             "-bulk-size", "50",  # Increased to speed up
