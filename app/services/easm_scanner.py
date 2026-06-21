@@ -1934,8 +1934,8 @@ async def _run_nuclei_phase(tenant_id: str, domains: list[str], modules: list[st
             pass
         return fallback
 
-    # 2. Batch targets in groups of 15
-    NUCLEI_BATCH_SIZE = 15
+    # 2. Batch targets in groups of 3
+    NUCLEI_BATCH_SIZE = 3
     batches = [domains[i:i + NUCLEI_BATCH_SIZE] for i in range(0, len(domains), NUCLEI_BATCH_SIZE)]
     
     for batch_idx, batch_domains in enumerate(batches):
@@ -2085,9 +2085,9 @@ async def _run_nuclei_phase(tenant_id: str, domains: list[str], modules: list[st
                                 continue
                             valid_dast_targets.append(cp)
                             
-                        # Sort to prioritize API paths and limit to 15 to prevent 15+ minute scans
+                        # Sort to prioritize API paths and limit to 5 to prevent 15+ minute scans
                         valid_dast_targets.sort(key=lambda x: 0 if "/api" in x or "/rest" in x else 1)
-                        for cp in valid_dast_targets[:15]:
+                        for cp in valid_dast_targets[:5]:
                             batch_targets.add(f"{w_url.rstrip('/')}{cp}")
         except Exception as e:
             logger.error(f"[EASM/Nuclei] Error loading batch assets: {e}")

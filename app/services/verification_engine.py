@@ -147,7 +147,7 @@ class NucleiVerificationEngine:
             base_targets = list(base_targets)
 
             # ── Phase 1: Broad exposure/misconfig scan (high-signal, fast) ──
-            phase1_tags = "exposure,default-login,takeover,env,misconfig,config,backup,auth,dump,metrics"
+            phase1_tags = "exposure,default-login,takeover,env,auth"
             phase1_paths = self._find_matching_templates(
                 ["http/exposures", "http/default-logins", "http/exposed-panels", "http/takeovers", "http/misconfiguration"],
                 phase1_tags
@@ -191,7 +191,7 @@ class NucleiVerificationEngine:
 
             # ── Phase 3: DAST (Dynamic Application Security Testing) ──
             # Run DAST templates if DAST paths/tags are requested or generally for comprehensive checks
-            phase3_tags = "dast,sqli,xss,ssti,lfi,rce,injection,idor,redirect"
+            phase3_tags = "dast,sqli,xss,lfi,idor"
             phase3_paths = self._find_matching_templates(
                 ["dast"],
                 phase3_tags
@@ -280,9 +280,9 @@ class NucleiVerificationEngine:
 
         cmd.extend([
             "-retries", "1",
-            "-bulk-size", "25",  # Concurrency settings optimized for speed and memory safety
+            "-bulk-size", "50",  # Increased to speed up
             "-rate-limit", "150",
-            "-c", "25",
+            "-c", "50",
             "-rsr", "1048576"   # Limit response size read to 1MB to save RAM buffers
         ])
         
